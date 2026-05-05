@@ -1,0 +1,179 @@
+# ML Trading Bot v3.0 — Event-Bar
+# Spec: Project Spec EventBars.md (§ references in comments)
+# Anchor: Grądzki/Wójcik/Lessmann 2025, Financial Innovation 11:136
+# All values FROZEN unless DR'd in PROJECT_LOG.md.
+
+project:
+  name:     ml-bot-events
+  version:  v3.0.0
+  root:     c:/Users/1/Documents/Workspace/trading/hyperliquid-ml-bot-events
+  timezone: UTC
+
+# ────────────────────────────────────────────────────────────────────
+# Database — shared Postgres+TimescaleDB instance (per 30m Decision v2.27)
+# Credentials in .env. Schema "events" for v3.0 tables.
+# ────────────────────────────────────────────────────────────────────
+database:
+  schema: events
+  chunk_interval_bars: "180 days"
+  retention_ticks: null   # raw aggTrades source-of-truth; never drop
+
+# ────────────────────────────────────────────────────────────────────
+# Phase A universe (§4.2)
+# ────────────────────────────────────────────────────────────────────
+universe:
+  phase_a: [BTC]
+  phase_b: [SOL, LINK]   # gated on Phase A pass
+  deferred: [TAO, HYPE]
+
+# ────────────────────────────────────────────────────────────────────
+# Data sources (§6)
+# ────────────────────────────────────────────────────────────────────
+data:
+  binance:
+    archive_host: "https://data.binance.vision/data/spot/monthly/aggTrades"
+    symbols:      [BTCUSDT]
+    start_date:   "2019-01-01"
+    storage_dir:  data/storage/binance_ticks
+  hyperliquid:
+    rest_url:  "https://api.hyperliquid.xyz"
+    ws_url:    "wss://api.hyperliquid.xyz/ws"
+    coins:     [BTC]
+    storage_dir: data/storage/hyperliquid
+
+# ────────────────────────────────────────────────────────────────────
+# Bar construction (§6.4) — CUSUM filter on log-returns
+# Per-asset dict; Phase A is BTC only.
+# ────────────────────────────────────────────────────────────────────
+bars:
+  type: cusum
+  threshold:           # FROZEN per spec §10.1
+    BTC: 0.02          # Lessmann anchor
+  max_bar_duration_hours: 168  # 7-day fail-safe; force close if no movement
+
+# ────────────────────────────────────────────────────────────────────
+# Feature engineering (§7) — replicate Lessmann's 33-feature set
+# ────────────────────────────────────────────────────────────────────
+features:
+  warmup_bars: 100
+  output_dir:  data/storage/features
+  ema_periods:        [5, 10, 15, 20, 50]
+  std_periods:        [5, 10, 15, 20, 50]
+  macd:               { fast: 12, slow: 26, signal: 9 }
+  rsi_periods:        [6, 10, 14]
+  stoch:              { k_period: 14, k_smooth: 3, d_smooth: 3 }
+  williams_r:         { period: 14 }
+  bollinger:          { period: 5, std: 2.0 }
+  cmf:                { period: 21 }
+  mfi:                { period: 14 }
+
+# ────────────────────────────────────────────────────────────────────
+# Labeling (§8) — triple-barrier static
+# ────────────────────────────────────────────────────────────────────
+labeling:
+  method: triple_barrier
+  tp_pct:                       # FROZEN per spec §10.1
+    BTC: 0.05
+  sl_pct:
+    BTC: 0.05
+  vertical_bars: 24             # FROZEN per spec §10.1
+  classes:
+    LONG:    0
+    SHORT:   1
+    NEUTRAL: 2
+
+# ────────────────────────────────────────────────────────────────────
+# Model — three-layer (§5.2)
+# ────────────────────────────────────────────────────────────────────
+model:
+  L0_lightgbm:                  # fast pre-gate baseline
+    objective:              multiclass
+    num_class:              3
+    metric:                 multi_logloss
+    boosting_type:          gbdt
+    num_leaves:             63
+    learning_rate:          0.05
+    feature_fraction:       0.8
+    bagging_fraction:       0.8
+    bagging_freq:           5
+    min_child_samples:      50
+    lambda_l1:              0.1
+    lambda_l2:              0.1
+    num_boost_round:        1000
+    early_stopping_rounds:  50
+    seed:                   42
+  L1_resnet_lstm:               # primary, Hyperband-tuned
+    sequence_length:        96
+    n_seeds_per_config:     3
+    top_k_configs:          3   # ensemble of top-3 val configs
+    search_space:
+      conv_kernel:        [3, 5, 7]
+      conv_channels:      [32, 64, 128]
+      lstm_hidden:        [64, 128, 256]
+      lstm_layers:        [1, 2]
+      dropout:            [0.1, 0.2, 0.3]
+      learning_rate:      [1.0e-5, 1.0e-3]   # log-uniform
+      batch_size:         [32, 64, 128]
+    max_trials:             50
+    timeout_sec:            28800     # 8 hr
+  signal_threshold:         0.60      # FROZEN per spec §10.1
+
+# ────────────────────────────────────────────────────────────────────
+# Walk-forward CV (§9.1) — purged-embargo
+# ────────────────────────────────────────────────────────────────────
+walk_forward:
+  initial_train_months: 24
+  val_months:           3
+  oot_months:           3
+  step_months:          3
+  purge_bars:           24    # = vertical_bars (cascade contract)
+  embargo_bars:         24
+  min_folds_required:   6
+
+# ────────────────────────────────────────────────────────────────────
+# Pre-gate (§10.3) — premise check
+# ────────────────────────────────────────────────────────────────────
+pre_gate:
+  metric:        val_logloss_over_prior   # = val_logloss / H(p)
+  threshold:     0.99
+  required_pass_folds: 4   # of first 6 folds
+
+# ────────────────────────────────────────────────────────────────────
+# Backtesting (§11)
+# ────────────────────────────────────────────────────────────────────
+backtest:
+  position_size_usd:     10000
+  leverage:              1
+  funding_modeled:       false   # Phase A; mandatory in Phase C
+  costs_bps_per_side:    5.5     # 3.5 taker + 2 slippage
+  costs_bps_round_trip:  11.0    # FROZEN per spec §10.1
+
+# ────────────────────────────────────────────────────────────────────
+# Risk (§13)
+# ────────────────────────────────────────────────────────────────────
+risk:
+  max_risk_per_trade_pct:   1.0
+  max_position_size_pct:    10.0
+  max_daily_loss_pct:       5.0
+  max_concurrent_positions: 1
+  daily_drawdown_kill_pct:  8.0
+
+# ────────────────────────────────────────────────────────────────────
+# Success criteria (§16)
+# ────────────────────────────────────────────────────────────────────
+success_criteria:
+  phase_a:
+    sharpe_after_costs_mean:    1.0
+    folds_positive_pct:         75.0
+    max_drawdown_worst_pct:     35.0
+    profitable_trade_pct_mean:  52.0
+    annual_return_after_costs:  10.0
+
+# ────────────────────────────────────────────────────────────────────
+# Logging
+# ────────────────────────────────────────────────────────────────────
+logging:
+  level:     INFO
+  dir:       logs
+  rotation:  100 MB
+  retention: 30 days
