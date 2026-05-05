@@ -7,6 +7,8 @@ reports/
 *.feather
 *.pickle
 *.pkl
+*.zip
+*.gz
 
 # Secrets
 .env

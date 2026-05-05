@@ -15,8 +15,10 @@ project:
 # ────────────────────────────────────────────────────────────────────
 database:
   schema: events
-  chunk_interval_bars: "180 days"
-  retention_ticks: null   # raw aggTrades source-of-truth; never drop
+  chunk_interval_bars:  "180 days"  # bar tables (Phase 0.2+)
+  chunk_interval_ticks: "7 days"    # tick hypertable — DR v3.0.2 §2
+  compress_after_ticks: "30 days"   # Timescale native compression — DR v3.0.2 §2
+  retention_ticks: null             # raw aggTrades source-of-truth; never drop
 
 # ────────────────────────────────────────────────────────────────────
 # Phase A universe (§4.2)

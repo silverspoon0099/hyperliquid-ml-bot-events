@@ -1,0 +1,19 @@
+# ML Trading Bot v3.0 — Event-Bar
+# Pinned per spec §15 ("requirements.txt with pinned versions").
+# Phase 0.1 deps only. Modeling deps (lightgbm, torch, keras-tuner) added Phase 1.
+
+# DB / Postgres + TimescaleDB
+psycopg[binary,pool]==3.2.3
+sqlalchemy==2.0.36
+
+# Config + env
+python-dotenv==1.0.1
+PyYAML==6.0.2
+
+# Ingest
+requests==2.32.3
+tqdm==4.67.1
+
+# Data
+pandas==2.2.3
+numpy==2.1.3
