@@ -16,16 +16,20 @@ The 8th column (was_best_match) is dropped. quote_qty is computed as
 price * qty per DR §1 (Binance does not publish it for aggTrades).
 
 Run:
-    python -m data.ingest_ticks            # full Phase 0.1 ingest
-    python -m data.ingest_ticks sanity     # sanity checks only
+    python -m data.ingest_ticks                       # full Phase 0.1 ingest
+    python -m data.ingest_ticks --month YYYY-MM       # single-month smoke test
+    python -m data.ingest_ticks --sanity              # sanity checks only
 """
 from __future__ import annotations
 
+import argparse
 import csv
 import hashlib
 import io
+import json
 import logging
 import sys
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -429,29 +433,69 @@ def run_ingest() -> None:
              months[-1] if months else "—")
 
     for symbol in binance_cfg["symbols"]:
-        # config has BTCUSDT (Binance ticker); audit-log key uses same string
         for month in months:
-            try:
-                ingest_one_month(symbol, month, storage_dir)
-            except Exception:
-                LOG.exception("[%s %s] failed — continuing", symbol, month)
+            t0 = time.perf_counter()
+            res = ingest_one_month(symbol, month, storage_dir)
+            elapsed = time.perf_counter() - t0
+            LOG.info("M %s: %s, %d rows in %.1f s",
+                     res["month"], res["status"], res["actual"], elapsed)
+    # No try/except per DR: fail fast on first error rather than skip months.
 
     print_sanity_report(sanity_checks())
 
 
+def _run_single_month(month_str: str) -> int:
+    """Smoke-test entry: ingest exactly one month, hard-fail on any error."""
+    cfg = load_config()
+    init_schema(
+        chunk_interval=cfg["database"]["chunk_interval_ticks"],
+        compress_after=cfg["database"]["compress_after_ticks"],
+    )
+
+    binance_cfg = cfg["data"]["binance"]
+    storage_dir = PROJECT_ROOT / binance_cfg["storage_dir"]
+    storage_dir.mkdir(parents=True, exist_ok=True)
+
+    month = date.fromisoformat(month_str + "-01")
+    today = datetime.now(timezone.utc).date()
+    cutoff = date(today.year, today.month, 1)
+    if month >= cutoff:
+        LOG.error("Cannot ingest in-flight month %s (cutoff=%s)", month, cutoff)
+        return 2
+
+    for symbol in binance_cfg["symbols"]:
+        t0 = time.perf_counter()
+        res = ingest_one_month(symbol, month, storage_dir)
+        elapsed = time.perf_counter() - t0
+        LOG.info("M %s: %s, %d rows in %.1f s",
+                 res["month"], res["status"], res["actual"], elapsed)
+        print(json.dumps(res, default=str, indent=2))
+    return 0
+
+
 def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="ingest_ticks")
+    p.add_argument("--month", metavar="YYYY-MM",
+                   help="Smoke-test: ingest a single month and exit.")
+    p.add_argument("--sanity", action="store_true",
+                   help="Run sanity checks only (no ingest).")
+    args = p.parse_args(argv[1:])
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    if len(argv) > 1 and argv[1] == "sanity":
-        print_sanity_report(sanity_checks())
-    else:
-        try:
-            run_ingest()
-        finally:
-            close_pool()
-    return 0
+
+    try:
+        if args.sanity:
+            print_sanity_report(sanity_checks())
+            return 0
+        if args.month:
+            return _run_single_month(args.month)
+        run_ingest()
+        return 0
+    finally:
+        close_pool()
 
 
 if __name__ == "__main__":
