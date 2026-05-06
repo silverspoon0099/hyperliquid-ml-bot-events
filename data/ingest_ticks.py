@@ -224,11 +224,29 @@ def _count_data_rows(zip_path: Path) -> int:
 # ─────────────────────────────────────────────────────────────────────────
 # DB loading (DR §3 — single transaction per month)
 # ─────────────────────────────────────────────────────────────────────────
-_COPY_SQL = (
-    "COPY events.ticks_btc "
+# DR v3.0.4: stage in TEMP without PK, then INSERT…ON CONFLICT into target.
+# `LIKE events.ticks_btc` copies columns + NOT NULL but NOT the PK constraint,
+# so staging accepts duplicate (agg_id, ts) rows. The target's PK then drops
+# the second occurrence silently via ON CONFLICT DO NOTHING.
+_CREATE_STAGING = (
+    "CREATE TEMP TABLE _staging_ticks (LIKE events.ticks_btc) ON COMMIT DROP"
+)
+
+_COPY_STAGING_SQL = (
+    "COPY _staging_ticks "
     "(agg_id, ts, price, qty, quote_qty, is_buyer_maker, first_trade_id, last_trade_id) "
     "FROM STDIN WITH (FORMAT BINARY)"
 )
+
+_INSERT_FROM_STAGING = """
+INSERT INTO events.ticks_btc
+    (agg_id, ts, price, qty, quote_qty, is_buyer_maker,
+     first_trade_id, last_trade_id)
+SELECT agg_id, ts, price, qty, quote_qty, is_buyer_maker,
+       first_trade_id, last_trade_id
+FROM _staging_ticks
+ON CONFLICT (agg_id, ts) DO NOTHING;
+"""
 _COPY_TYPES = ["bigint", "timestamptz", "float8", "float8", "float8",
                "bool", "bigint", "bigint"]
 
@@ -269,22 +287,27 @@ def _ingest_month_atomic(
     expected_rows: int,
     ticks: Iterable[Tick],
 ) -> int:
-    """DR §3 step 8: DELETE range → COPY → audit log, all in one tx."""
-    actual = 0
+    """DR v3.0.2 §3 step 8 + DR v3.0.4: DELETE range → COPY into TEMP
+    staging → INSERT…ON CONFLICT into target → audit log. Single tx.
+    Returns post-dedup row count (may be < expected_rows if the source
+    CSV contained Binance publishing duplicates).
+    """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "DELETE FROM events.ticks_btc WHERE ts >= %s AND ts < %s",
                 (month, _next_month(month)),
             )
-            with cur.copy(_COPY_SQL) as cp:
+            cur.execute(_CREATE_STAGING)
+            with cur.copy(_COPY_STAGING_SQL) as cp:
                 cp.set_types(_COPY_TYPES)
                 for t in ticks:
                     cp.write_row((
                         t.agg_id, t.ts, t.price, t.qty, t.quote_qty,
                         t.is_buyer_maker, t.first_trade_id, t.last_trade_id,
                     ))
-                    actual += 1
+            cur.execute(_INSERT_FROM_STAGING)
+            actual = cur.rowcount
             cur.execute(_LOG_UPSERT, (symbol, month, sha256, expected_rows, actual))
         conn.commit()
     return actual
@@ -336,24 +359,33 @@ def ingest_one_month(symbol: str, month: date, storage_dir: Path) -> dict:
         "download_s": download_s, "sha_s": sha_s, "count_s": count_s,
     }
 
-    if existing >= expected and logged == published:
+    # DR v3.0.4: SHA-only skip rule. Atomicity guarantees no partial COPY
+    # ever lands in ingest_log, so a logged sha match implies a complete
+    # prior ingest. With dedup, post-dedup count < raw expected for some
+    # months, so the old "existing >= expected" check would force forever
+    # re-ingestion.
+    if logged is not None and logged == published:
         return {**base, "status": "skipped", "actual": existing, "copy_s": 0.0}
 
-    if existing >= expected and logged != published:
+    if logged is not None and logged != published:
         LOG.warning("[%s %s] sha changed (logged=%s published=%s) — re-ingest",
                     symbol, yyyymm, logged, published)
 
-    # 8. atomic: DELETE + COPY + log
+    # 8. atomic: DELETE + COPY into staging + INSERT into target + log
     t0 = time.perf_counter()
     actual = _ingest_month_atomic(
         symbol, month, zip_path, published, expected, _iter_ticks(zip_path)
     )
     copy_s = time.perf_counter() - t0
-    if actual != expected:
+    if actual > expected:
         raise RuntimeError(
-            f"[{symbol} {yyyymm}] row count mismatch: expected={expected} "
-            f"loaded={actual} — transaction rolled back? investigate"
+            f"[{symbol} {yyyymm}] row count overshoot: expected={expected} "
+            f"loaded={actual} — impossible by construction, investigate"
         )
+    if actual < expected:
+        LOG.info("[%s %s] dedup: %d duplicate rows in source CSV "
+                 "(kept %d / %d)",
+                 symbol, yyyymm, expected - actual, actual, expected)
     return {**base, "status": "ingested", "actual": actual, "copy_s": copy_s}
 
 
@@ -431,6 +463,16 @@ def sanity_checks() -> dict:
                 FROM events.ingest_log
             """)
             out["ingest_log_audit"] = dict(cur.fetchone())
+
+            # DR v3.0.4: source-dupe diagnostic — Binance publishing artifacts
+            cur.execute("""
+                SELECT month, expected_rows, actual_rows,
+                       expected_rows - actual_rows AS source_dupes
+                FROM events.ingest_log
+                WHERE actual_rows < expected_rows
+                ORDER BY month
+            """)
+            out["source_dupes"] = [dict(r) for r in cur.fetchall()]
     return out
 
 
@@ -503,6 +545,17 @@ def print_sanity_report(rep: dict) -> None:
     print(f"  rows:       {a['n_rows']}")
     print(f"  unique sha: {a['n_unique_sha']}")
     print(f"  null sha:   {a['n_null']}")
+
+    # DR v3.0.4: source-dupe diagnostic
+    dupes = rep["source_dupes"]
+    print(f"\n--- source-dupe diagnostic: {len(dupes)} affected month(s) ---")
+    if dupes:
+        for d in dupes:
+            print(f"   {d['month']:%Y-%m}  expected={d['expected_rows']:>11,}  "
+                  f"actual={d['actual_rows']:>11,}  "
+                  f"dupes={d['source_dupes']:,}")
+        total_dupes = sum(d["source_dupes"] for d in dupes)
+        print(f"   total source dupes across all months: {total_dupes:,}")
 
 
 # ─────────────────────────────────────────────────────────────────────────

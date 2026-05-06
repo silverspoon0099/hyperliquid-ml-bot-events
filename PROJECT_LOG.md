@@ -5,6 +5,124 @@
 
 ---
 
+## 2026-05-06 — Decision v3.0.4 — Loader fix: dedup Binance source-data duplicates (DR)
+
+**Context**: After DR v3.0.3 patched the multi-CSV archive case, STEP 3
+sweep continued and failed at month 51 (2026-02) with a fresh failure
+mode: `psycopg.errors.UniqueViolation: duplicate key value violates
+unique constraint "ticks_btc_pkey", Key (agg_id, ts)=(3856672511,
+2026-02-11 00:00:00.008822+00) already exists`. The 2026-02 BTCUSDT
+aggTrades CSV contains internal duplicate rows — a Binance publishing
+artifact:
+
+    total CSV data rows:           52,474,665
+    unique agg_ids:                52,471,665
+    agg_ids that appear >1 time:   2,000   (1,000 at 2x; 1,000 at 3x)
+    extra rows from dupes:         3,000   (0.006% of file)
+
+Sample: agg_id `3856672511` appears 3× at lines 25,562,325 / 25,564,325
+/ 25,565,325 — bytes-identical (same price, qty, ts, trade IDs, flags).
+The "1,000 of each multiplicity" pattern looks like a batch-processing
+artifact, not random corruption — likely affects more recent months too
+as the publisher continues operating.
+
+State at failure: 85 of 88 months done cleanly (2019-01..2026-01); 0
+rows in DB for 2026-02 (atomic rollback per DR v3.0.2 §3 step 8 worked
+again); resumable.
+
+**Decisions**:
+
+### 1. Staging-table dedup pattern in `_ingest_month_atomic`
+
+Replace direct `COPY events.ticks_btc FROM STDIN` with:
+
+1. `CREATE TEMP TABLE _staging_ticks (LIKE events.ticks_btc) ON COMMIT DROP`
+   — `LIKE` copies columns + NOT NULL but NOT the PK; staging accepts
+   duplicate `(agg_id, ts)` rows.
+2. `COPY _staging_ticks ... FROM STDIN WITH (FORMAT BINARY)` — same
+   binary COPY as before, but into the no-PK staging table.
+3. `INSERT INTO events.ticks_btc SELECT … FROM _staging_ticks
+   ON CONFLICT (agg_id, ts) DO NOTHING` — Postgres handles dedup; first
+   row wins, subsequent occurrences silently dropped. `cur.rowcount` =
+   post-dedup count.
+4. `INSERT INTO events.ingest_log` (unchanged), then commit.
+
+All steps in one transaction. Same atomicity contract as DR v3.0.2 §3.
+TEMP table auto-drops on commit/rollback.
+
+Rejected alternatives:
+- Python-side dedup set: ~2 GB memory for 30M+ agg_ids; defeats COPY's
+  memory-efficiency.
+- Sliding-window dedup: assumes locality of duplicates (false — sample
+  shows dupes 1,000–2,000 lines apart).
+- Schema column for `staged_rows`: extra column, recoverable from
+  `expected_rows - actual_rows`.
+
+### 2. Three contract changes
+
+a) **`actual_rows` in `events.ingest_log` is post-dedup count** (was raw
+   COPY rowcount). The 85 already-done months had no dupes (else the
+   pre-DR-v3.0.4 code would have failed on them, as 2026-02 did) so
+   their `actual_rows == expected_rows`. New months with dupes will
+   have `actual_rows < expected_rows`. Diagnostic query:
+
+   ```sql
+   SELECT month, expected_rows, actual_rows,
+          expected_rows - actual_rows AS source_dupes
+   FROM events.ingest_log
+   WHERE actual_rows < expected_rows
+   ORDER BY month;
+   ```
+
+b) **Hard assertion `actual == expected` relaxes to `actual <= expected`**.
+   Hard-fail only if `actual > expected` (impossible by construction;
+   firing = bug). When `actual < expected`, log INFO line:
+   `[BTCUSDT 2026-02] dedup: 3000 duplicate rows in source CSV (kept 52471665 / 52474665)`.
+
+c) **Skip rule simplifies from `existing >= expected AND sha matches` to
+   `sha matches`**. After dedup, `existing == actual_post_dedup <
+   expected_raw` for affected months — the count check would force
+   every-dup-month to re-ingest forever, breaking idempotency. The
+   SHA256 match is the cryptographic proof that the same archive was
+   processed before; atomicity guarantees no partial COPY ever lands in
+   `events.ingest_log`, so a logged SHA implies a complete prior ingest.
+   Republish detection unchanged: SHA mismatch → force re-ingest.
+
+### 3. Performance estimate
+
+Per-month time goes from `COPY only` to `COPY into staging + INSERT…ON
+CONFLICT into target`. For 50M-row months: ~250s COPY + ~100–200s
+INSERT pass = **~1.5–2× original time**. For the 3 remaining months,
+total cost is ~10 min above the unpatched baseline.
+
+### 4. Sanity-report addition
+
+`sanity_checks` adds a `source_dupes` query; `print_sanity_report` adds
+a "source-dupe diagnostic" section listing all months where
+`actual_rows < expected_rows`, the gap per month, and total dupes
+across all months. Surfaces the long-tail of Binance publishing
+artifacts in one place.
+
+### 5. Why no formal smoke test before resume
+
+User decision: live ingest of 2026-02 = implicit smoke test. The
+atomicity contract has demonstrably worked twice in production (DR
+v3.0.2 + DR v3.0.3 failures both rolled back cleanly). Cost of a
+hidden bug = another atomic rollback at month 51 (~$0 to recover).
+Cost of a 5-min smoke test = 5 min. Marginal call; lean toward resume.
+
+If 2026-03 or 2026-04 fail with a third failure mode, fail-fast and
+report — do not handle a third class of edge case inline.
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-06; all three
+contract changes accepted.
+
+**References**: DR v3.0.2 §3 (atomicity contract), DR v3.0.3 (prior
+loader fix), failure log `logs/ingest_full.log` (2026-02 traceback +
+duplicate analysis: 2,000 affected agg_ids / 3,000 extra rows).
+
+---
+
 ## 2026-05-06 — Decision v3.0.3 — Loader fix: multi-file Binance archive (DR)
 
 **Context**: DR v3.0.2 STEP 3 full sweep failed at month 35 (2021-12) when
