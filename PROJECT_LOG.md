@@ -5,6 +5,97 @@
 
 ---
 
+## 2026-05-06 — Decision v3.0.3 — Loader fix: multi-file Binance archive (DR)
+
+**Context**: DR v3.0.2 STEP 3 full sweep failed at month 35 (2021-12) when
+`_open_csv` asserted `len(zf.namelist()) == 1`. The 2021-12 BTCUSDT
+aggTrades zip from Binance Vision contains TWO files:
+
+    2,694,397,270 bytes  CRC=0x359574b8  BTCUSDT-aggTrades-2021-12.csv
+    2,694,397,270 bytes  CRC=0x359574b8  fsx-data/collector_data/data/spot/monthly/aggTrades/BTCUSDT/BTCUSDT-aggTrades-2021-12.csv
+
+Bytes-identical per CRC32. Second path looks like an AWS FSx collector
+mount that leaked into Binance's archive structure. State at failure:
+35 months done cleanly; 0 rows in DB for 2021-12 (atomic rollback per
+DR v3.0.2 §3 step 8); resumable.
+
+**Decisions**:
+
+### 1. `_open_csv` selection logic
+
+Selects the canonical root-level CSV matching `{zip_stem}.csv`. Falls
+back to nested matches only if no root match. Hard-fails if no match
+at all.
+
+```python
+def _open_csv(zip_path):
+    zf = zipfile.ZipFile(zip_path)
+    names = zf.namelist()
+    expected = zip_path.stem + ".csv"
+    candidates = [n for n in names
+                  if n == expected or n.endswith("/" + expected)]
+    root = [n for n in candidates if "/" not in n]
+    chosen = root[0] if root else (candidates[0] if candidates else None)
+    if chosen is None:
+        zf.close()
+        raise ValueError(...)
+    if len(candidates) > 1:
+        ...  # log line — see §2
+    return zf, zf.open(chosen)
+```
+
+### 2. Inline audit log (replaces rejected separate-sanity-pass option)
+
+When `len(candidates) > 1`, emit one INFO log line per `_open_csv`
+call. Format:
+
+    [BTCUSDT 2021-12] zip contains 2 CSVs; using
+    BTCUSDT-aggTrades-2021-12.csv, others: ['fsx-data/...']
+
+Captures the multi-CSV case in `logs/ingest_full.log` at zero extra
+cost. No second pass over the 500 GB pile.
+
+Note: `_open_csv` is called twice per month in production (once from
+`_count_data_rows`, once from `_iter_ticks` via `_ingest_month_atomic`),
+so an affected month emits two log lines, not one. Accepted: the
+duplication accurately reflects two distinct call sites; module-level
+dedup state would violate "no abstractions for hypothetical future
+requirements." Per-month affected count is recoverable via
+`grep -c '"zip contains"' logs/ingest_full.log` divided by 2.
+
+**Why safe**:
+- Zip-level SHA256 (DR v3.0.2 §3 step 2) unchanged — same archive contract
+- Two CSVs are bit-identical per CRC32 — picking either loads same data
+- Root-level filename is Binance's canonical convention; nested paths
+  are packaging artifacts
+- Future divergence would surface in the per-month agg_id density check
+  during STEP 3's sanity report
+
+**Why NOT validate-both-copies-match at runtime**:
+- Adds a full-decompress pass per affected month (multi-GB)
+- Zip-SHA already proves archive is what Binance shipped
+- Keep the loader simple
+
+**Smoke-test result** (2021-12 zip, no DB write):
+- Multi-CSV log line fires with correct format
+- Chosen file: `BTCUSDT-aggTrades-2021-12.csv` (root-level)
+- `_count_data_rows` and `_iter_ticks` both yield 32,269,900 — exact match
+- First 5 ticks parse cleanly; prices ~$56,950 (consistent with Dec 1
+  2021 BTC near $57k); ts in expected range
+- Magnitude plausible for late-2021 BTC
+
+**Resume plan**: idempotency (DR v3.0.2 §3) skips the 35 already-done
+months instantly; sweep resumes from 2021-12. ETA for remaining 53
+months: ~3 hr at observed rates.
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-06; chose
+"behavior B" (no module-level dedup) for the multi-CSV log line.
+
+**References**: DR v3.0.2 §3; failure log `logs/ingest_full.log`;
+smoke-test transcript (this conversation).
+
+---
+
 ## 2026-05-05 — Decision v3.0.2 — Phase 0.1 raw tick ingestion contract (DR)
 
 **Context**: Spec §6 defines the CUSUM-bar table (`events.bars_btc_cusum`) but
