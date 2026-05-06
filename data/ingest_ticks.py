@@ -142,12 +142,38 @@ def _parse_bool(raw: str) -> bool:
 
 
 def _open_csv(zip_path: Path):
+    """Open the canonical CSV inside the Binance Vision aggTrades zip.
+
+    DR v3.0.3: some Binance archives ship the CSV twice — once at the
+    root and once at a nested `fsx-data/...` packaging-artifact path
+    (the two copies are byte-identical, verified via CRC32). Select the
+    root-level match; fall back to nested only if there is no root
+    match. Hard-fail if the expected name is absent entirely.
+    """
     zf = zipfile.ZipFile(zip_path)
     names = zf.namelist()
-    if len(names) != 1:
+    expected = zip_path.stem + ".csv"
+    candidates = [n for n in names
+                  if n == expected or n.endswith("/" + expected)]
+    root = [n for n in candidates if "/" not in n]
+    chosen = root[0] if root else (candidates[0] if candidates else None)
+    if chosen is None:
         zf.close()
-        raise ValueError(f"Expected 1 file in {zip_path}, found {names}")
-    return zf, zf.open(names[0])
+        raise ValueError(
+            f"No CSV named {expected} in {zip_path}; archive contains {names}"
+        )
+    if len(candidates) > 1:
+        # Surface the multi-CSV case inline (DR v3.0.3 §Decision):
+        # one log line per affected month, no separate sanity pass.
+        parts = zip_path.stem.split("-aggTrades-")
+        sym = parts[0] if len(parts) == 2 else "?"
+        mon = parts[1] if len(parts) == 2 else "?"
+        others = [n for n in candidates if n != chosen]
+        LOG.info(
+            "[%s %s] zip contains %d CSVs; using %s, others: %s",
+            sym, mon, len(candidates), chosen, others,
+        )
+    return zf, zf.open(chosen)
 
 
 def _iter_ticks(zip_path: Path) -> Iterator[Tick]:
