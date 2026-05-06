@@ -268,20 +268,23 @@ def _ingest_month_atomic(
 # Per-month orchestration
 # ─────────────────────────────────────────────────────────────────────────
 def ingest_one_month(symbol: str, month: date, storage_dir: Path) -> dict:
-    """Idempotent ingest of one (symbol, month). Returns a status dict."""
+    """Idempotent ingest of one (symbol, month). Returns a status dict
+    with phase timings: download_s, sha_s, count_s, copy_s."""
     yyyymm = f"{month:%Y-%m}"
     zip_name = f"{symbol}-aggTrades-{yyyymm}.zip"
     zip_path = storage_dir / symbol / zip_name
     sha_path = storage_dir / symbol / (zip_name + ".CHECKSUM")
 
     # 1. download (skip if cached)
+    t0 = time.perf_counter()
     if not zip_path.exists():
-        LOG.info("[%s %s] downloading zip", symbol, yyyymm)
         _download(_zip_url(symbol, month), zip_path)
     if not sha_path.exists():
         _download(_checksum_url(symbol, month), sha_path)
+    download_s = time.perf_counter() - t0
 
     # 2. verify SHA256
+    t0 = time.perf_counter()
     published = _published_sha256(sha_path)
     actual_sha = _file_sha256(zip_path)
     if published != actual_sha:
@@ -289,39 +292,43 @@ def ingest_one_month(symbol: str, month: date, storage_dir: Path) -> dict:
             f"[{symbol} {yyyymm}] SHA mismatch: published={published} "
             f"actual={actual_sha} — refusing to ingest"
         )
+    sha_s = time.perf_counter() - t0
 
     # 3. expected row count
+    t0 = time.perf_counter()
     expected = _count_data_rows(zip_path)
+    count_s = time.perf_counter() - t0
 
-    # 4 + 5 + 6 + 7. skip / re-ingest decision
+    # 4-7. skip / re-ingest decision
     with get_connection() as conn:
         with conn.cursor() as cur:
             existing = _existing_count(cur, month)
             logged = _logged_sha(cur, symbol, month)
 
+    base = {
+        "month": yyyymm, "expected": expected, "sha256": published,
+        "download_s": download_s, "sha_s": sha_s, "count_s": count_s,
+    }
+
     if existing >= expected and logged == published:
-        LOG.info("[%s %s] already complete (%d rows, sha match) — skip",
-                 symbol, yyyymm, existing)
-        return {"month": yyyymm, "status": "skipped",
-                "expected": expected, "actual": existing, "sha256": published}
+        return {**base, "status": "skipped", "actual": existing, "copy_s": 0.0}
 
     if existing >= expected and logged != published:
         LOG.warning("[%s %s] sha changed (logged=%s published=%s) — re-ingest",
                     symbol, yyyymm, logged, published)
 
     # 8. atomic: DELETE + COPY + log
-    LOG.info("[%s %s] ingesting %d rows", symbol, yyyymm, expected)
+    t0 = time.perf_counter()
     actual = _ingest_month_atomic(
         symbol, month, zip_path, published, expected, _iter_ticks(zip_path)
     )
+    copy_s = time.perf_counter() - t0
     if actual != expected:
         raise RuntimeError(
             f"[{symbol} {yyyymm}] row count mismatch: expected={expected} "
             f"loaded={actual} — transaction rolled back? investigate"
         )
-    LOG.info("[%s %s] ingested %d rows", symbol, yyyymm, actual)
-    return {"month": yyyymm, "status": "ingested",
-            "expected": expected, "actual": actual, "sha256": published}
+    return {**base, "status": "ingested", "actual": actual, "copy_s": copy_s}
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -381,38 +388,119 @@ def sanity_checks() -> dict:
             out["agg_id_per_month"] = [
                 (r["m"], r["min_id"], r["max_id"], r["n"]) for r in cur.fetchall()
             ]
+
+            # (d) agg_id global span vs count
+            cur.execute("""
+                SELECT MIN(agg_id) AS mn, MAX(agg_id) AS mx, COUNT(*) AS n,
+                       MAX(agg_id) - MIN(agg_id) + 1 AS span
+                FROM events.ticks_btc
+            """)
+            out["agg_id_global"] = dict(cur.fetchone())
+
+            # ingest_log audit
+            cur.execute("""
+                SELECT COUNT(*) AS n_rows,
+                       COUNT(DISTINCT sha256) AS n_unique_sha,
+                       SUM((sha256 IS NULL)::int) AS n_null
+                FROM events.ingest_log
+            """)
+            out["ingest_log_audit"] = dict(cur.fetchone())
     return out
 
 
 def print_sanity_report(rep: dict) -> None:
+    print("\n========== Phase 0.1 Sanity Report ==========")
     print(f"Total ticks:    {rep['total_ticks']:,}")
     print(f"First ts:       {rep['first_ts']}")
     print(f"Last ts:        {rep['last_ts']}")
     print(f"Months covered: {len(rep['ticks_per_month'])}")
+
+    # (a) Per-month tick counts
+    print("\n--- (a) Per-month tick counts ---")
+    for m, n in rep["ticks_per_month"]:
+        print(f"  {m:%Y-%m}  {n:>14,}")
+    counts = [n for _, n in rep["ticks_per_month"]]
+    if counts:
+        median = sorted(counts)[len(counts) // 2]
+        print(f"  min={min(counts):,}  max={max(counts):,}  median={median:,}")
+
+    # (b) Daily volume — top-20 highest by quote volume
+    print("\n--- (b) Top-20 daily quote-volume days ---")
+    daily = rep["daily_quote_volume"]
+    top = sorted(daily, key=lambda x: -float(x[1] or 0))[:20]
+    for d, q in top:
+        print(f"  {d:%Y-%m-%d}  ${float(q or 0):>18,.0f}")
+    print(f"  total days with ticks: {len(daily):,}")
+
+    # (c) Minute-aggregated activity gaps > 1 hr
     gaps = rep["activity_gaps_gt_1h"]
-    print(f"Activity gaps > 1h: {len(gaps)}")
-    for m, g in gaps[:20]:
+    print(f"\n--- (c) Activity gaps > 1 hr: {len(gaps)} ---")
+    for m, g in gaps:
         print(f"   {m}  +{g}")
-    if len(gaps) > 20:
-        print(f"   ... +{len(gaps) - 20} more")
-    # monotonicity check
+
+    # Per-month agg_id monotonicity (across-month)
     last_max = -1
-    breaks = []
+    breaks: list = []
     for m, mn, mx, _ in rep["agg_id_per_month"]:
         if mn <= last_max:
             breaks.append((m, last_max, mn))
         last_max = mx
     if breaks:
-        print(f"agg_id MONOTONICITY BREAKS: {len(breaks)}")
-        for m, prev_max, cur_min in breaks[:5]:
-            print(f"   month={m} prev_max={prev_max} cur_min={cur_min}")
+        print(f"\n--- agg_id ACROSS-MONTH BREAKS: {len(breaks)} ---")
+        for m, prev_max, cur_min in breaks[:10]:
+            print(f"   month={m} prev_max={prev_max:,} cur_min={cur_min:,}")
     else:
-        print("agg_id monotonic across months: OK")
+        print("\n--- agg_id monotonic across months: OK ---")
+
+    # (d) Global agg_id span vs count
+    g = rep["agg_id_global"]
+    n = g["n"] or 0
+    span = g["span"] or 0
+    print("\n--- (d) agg_id global ---")
+    print(f"  MIN(agg_id) = {g['mn']:,}")
+    print(f"  MAX(agg_id) = {g['mx']:,}")
+    print(f"  COUNT(*)    = {n:,}")
+    print(f"  span        = {span:,}")
+    if span:
+        gap = span - n
+        print(f"  span - count = {gap:,}  ({gap / span * 100:.4f}% gap fraction)")
+        if n > span:
+            print("  WARNING: count > span — duplicates present?")
+        elif n == span:
+            print("  count == span: zero gaps (every agg_id present)")
+        else:
+            print("  count < span: OK (small Binance-side gaps allowed)")
+
+    # ingest_log audit
+    a = rep["ingest_log_audit"]
+    print("\n--- ingest_log audit ---")
+    print(f"  rows:       {a['n_rows']}")
+    print(f"  unique sha: {a['n_unique_sha']}")
+    print(f"  null sha:   {a['n_null']}")
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────
+def _print_checkpoint(after_month: str, cum_rows: int, cum_t: float) -> None:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) AS n FROM timescaledb_information.chunks
+                WHERE hypertable_schema='events' AND hypertable_name='ticks_btc'
+            """)
+            chunks = cur.fetchone()["n"]
+            cur.execute(
+                "SELECT pg_size_pretty(hypertable_size('events.ticks_btc')) AS sz"
+            )
+            size = cur.fetchone()["sz"]
+    print(
+        f"=== checkpoint after {after_month}: rows={cum_rows:,}  "
+        f"time={cum_t:.0f}s  chunks={chunks}  size={size} ===",
+        flush=True,
+    )
+
+
 def run_ingest() -> None:
     cfg = load_config()
     init_schema(
@@ -426,20 +514,49 @@ def run_ingest() -> None:
 
     start = date.fromisoformat(binance_cfg["start_date"])
     today = datetime.now(timezone.utc).date()
-    months = months_to_ingest(start, today)
+    all_months = months_to_ingest(start, today)
 
-    LOG.info("Phase 0.1 ingest: %d months from %s to %s (excl. current)",
-             len(months), months[0] if months else "—",
-             months[-1] if months else "—")
+    # Pre-filter months already in ingest_log so [NN/total] reflects pending
+    # work only. ingest_one_month still detects sha-republish on filtered-in
+    # months; pre-filtered months are trusted by audit log presence.
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT symbol, month FROM events.ingest_log")
+            done = {(r["symbol"], r["month"]) for r in cur.fetchall()}
 
-    for symbol in binance_cfg["symbols"]:
-        for month in months:
-            t0 = time.perf_counter()
-            res = ingest_one_month(symbol, month, storage_dir)
-            elapsed = time.perf_counter() - t0
-            LOG.info("M %s: %s, %d rows in %.1f s",
-                     res["month"], res["status"], res["actual"], elapsed)
-    # No try/except per DR: fail fast on first error rather than skip months.
+    work = [
+        (symbol, month)
+        for symbol in binance_cfg["symbols"]
+        for month in all_months
+        if (symbol, month) not in done
+    ]
+    N = len(work)
+    total = len(all_months) * len(binance_cfg["symbols"])
+    print(
+        f"Phase 0.1 ingest: {N} pending of {total} total "
+        f"({len(done)} already in ingest_log)",
+        flush=True,
+    )
+
+    cum_rows = 0
+    cum_t = 0.0
+    for i, (symbol, month) in enumerate(work, start=1):
+        t0 = time.perf_counter()
+        res = ingest_one_month(symbol, month, storage_dir)
+        total_s = time.perf_counter() - t0
+        cum_rows += res["actual"]
+        cum_t += total_s
+        print(
+            f"[{i:>2}/{N}] {res['month']}  "
+            f"download={res['download_s']:5.1f}s  sha=ok  "
+            f"rows={res['actual']:>10,}  "
+            f"copy={res['copy_s']:5.1f}s  "
+            f"total={total_s:5.1f}s",
+            flush=True,
+        )
+        if i % 12 == 0 or i == N:
+            _print_checkpoint(res["month"], cum_rows, cum_t)
+    # No try/except: STEP 3 contract — fail fast, do not skip and continue.
 
     print_sanity_report(sanity_checks())
 
