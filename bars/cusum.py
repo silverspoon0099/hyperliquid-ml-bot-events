@@ -208,6 +208,10 @@ def build_bars(
     bars: list[Bar] = []
     builder = CusumBuilder(threshold, max_duration_h)
     n_ticks = 0
+    prev_month: Optional[tuple[int, int]] = None
+    month_ticks = 0
+    month_bars = 0
+    month_t0 = time.perf_counter()
     t0 = time.perf_counter()
 
     with get_connection() as conn:
@@ -215,13 +219,47 @@ def build_bars(
             with cur.copy(_ticks_query(month_filter)) as copy:
                 copy.set_types(["timestamptz", "float8", "float8"])
                 for ts, price, qty in copy.rows():
+                    cur_month = (ts.year, ts.month)
+                    if prev_month is None:
+                        prev_month = cur_month
+                    elif cur_month != prev_month:
+                        elapsed = time.perf_counter() - month_t0
+                        LOG.info(
+                            "[scan] %04d-%02d: ticks=%d processed, "
+                            "bars=%d emitted, elapsed=%.1fs",
+                            prev_month[0], prev_month[1],
+                            month_ticks, month_bars, elapsed,
+                        )
+                        prev_month = cur_month
+                        month_ticks = 0
+                        month_bars = 0
+                        month_t0 = time.perf_counter()
                     n_ticks += 1
+                    month_ticks += 1
                     bar = builder.step(ts, price, qty)
                     if bar is not None:
                         bars.append(bar)
+                        month_bars += 1
+                # Emit final-month progress on EOF
+                if prev_month is not None and month_ticks > 0:
+                    elapsed = time.perf_counter() - month_t0
+                    LOG.info(
+                        "[scan] %04d-%02d: ticks=%d processed, "
+                        "bars=%d emitted, elapsed=%.1fs",
+                        prev_month[0], prev_month[1],
+                        month_ticks, month_bars, elapsed,
+                    )
         scan_s = time.perf_counter() - t0
-        LOG.info("scan complete: %d ticks → %d bars in %.1f s",
-                 n_ticks, len(bars), scan_s)
+        n_force_closed = sum(
+            1 for b in bars
+            if max(b.cusum_pos, -b.cusum_neg) < threshold
+        )
+        rate = int(n_ticks / scan_s) if scan_s > 0 else 0
+        LOG.info(
+            "[done] total ticks=%.2fB, total bars=%d, elapsed=%.1fs, "
+            "force-closed=%d, throughput=%d ticks/sec",
+            n_ticks / 1e9, len(bars), scan_s, n_force_closed, rate,
+        )
 
         if not dry_run:
             t1 = time.perf_counter()
@@ -304,6 +342,120 @@ def _format_bar(b: Bar, threshold: float) -> str:
 # ─────────────────────────────────────────────────────────────────────
 # CLI entry point
 # ─────────────────────────────────────────────────────────────────────
+def sanity_report(threshold: float) -> None:
+    """Phase 0.2 post-build sanity report (DR v3.0.5 'Sanity checks')."""
+    print("\n========== Phase 0.2 Sanity Report ==========")
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT COUNT(*) AS n,
+                       MIN(bar_open_ts)  AS first_open,
+                       MAX(bar_close_ts) AS last_close
+                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+            """, (threshold,))
+            r = cur.fetchone()
+            n_total = r["n"]
+            print(f"Threshold:    {threshold}")
+            print(f"Total bars:   {n_total:,}")
+            print(f"First open:   {r['first_open']}")
+            print(f"Last close:   {r['last_close']}")
+            if n_total == 0:
+                print("WARNING: zero bars in DB — investigate")
+                return
+
+            # Bars per month
+            cur.execute("""
+                SELECT date_trunc('month', bar_close_ts) AS m, COUNT(*) AS n
+                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+                GROUP BY 1 ORDER BY 1
+            """, (threshold,))
+            month_rows = list(cur.fetchall())
+            print(f"\n--- Bars per month ({len(month_rows)} months) ---")
+            for r in month_rows:
+                m = r["m"]
+                next_m = (date(m.year + 1, 1, 1) if m.month == 12
+                          else date(m.year, m.month + 1, 1))
+                days = (next_m - m.date()).days
+                print(f"  {m:%Y-%m}  bars={r['n']:>5}  /day={r['n']/days:>5.2f}")
+            counts = [r["n"] for r in month_rows]
+            print(f"  min={min(counts)}  max={max(counts)}  "
+                  f"median={sorted(counts)[len(counts)//2]}")
+
+            # Close-reason distribution
+            cur.execute("""
+                SELECT
+                    CASE WHEN GREATEST(cusum_pos, -cusum_neg) >= threshold_pct
+                         THEN 'cusum' ELSE 'timeout' END AS reason,
+                    COUNT(*) AS n
+                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+                GROUP BY 1
+            """, (threshold,))
+            print(f"\n--- Close-reason distribution ---")
+            timeout_pct = 0.0
+            for r in cur.fetchall():
+                pct = r["n"] * 100.0 / n_total
+                print(f"  {r['reason']:>10}: {r['n']:>6,}  ({pct:>5.2f}%)")
+                if r["reason"] == "timeout":
+                    timeout_pct = pct
+            if timeout_pct > 5.0:
+                print(f"  WARNING: timeout fraction {timeout_pct:.2f}% > 5% — "
+                      f"threshold or fail-safe may be misconfigured")
+
+            # Duration percentiles
+            cur.execute("""
+                SELECT EXTRACT(EPOCH FROM (bar_close_ts - bar_open_ts)) AS dur_s
+                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+                ORDER BY 1
+            """, (threshold,))
+            durations = [r["dur_s"] for r in cur.fetchall()]
+            mn = durations[0]
+            med = durations[len(durations) // 2]
+            p95 = durations[int(len(durations) * 0.95)]
+            mx = durations[-1]
+            print(f"\n--- Bar duration ---")
+            print(f"  min:    {mn:>10,.0f}s  ({mn/60:>7.2f} min)")
+            print(f"  median: {med:>10,.0f}s  ({med/3600:>7.2f} h)")
+            print(f"  p95:    {p95:>10,.0f}s  ({p95/3600:>7.2f} h)")
+            print(f"  max:    {mx:>10,.0f}s  ({mx/3600:>7.2f} h)")
+            if mx > 168 * 3600 + 1:
+                print(f"  ERROR: max duration > 168h fail-safe — algorithm bug")
+
+            # Bar invariants
+            cur.execute("""
+                SELECT
+                    SUM((high < GREATEST(open, close))::int) AS bad_high,
+                    SUM((low  > LEAST(open, close))::int)    AS bad_low,
+                    SUM((n_trades < 1)::int)                 AS bad_n,
+                    SUM((volume <= 0)::int)                  AS bad_vol
+                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+            """, (threshold,))
+            inv = cur.fetchone()
+            print(f"\n--- Bar invariants ---")
+            print(f"  high < max(open,close): {inv['bad_high']}")
+            print(f"  low  > min(open,close): {inv['bad_low']}")
+            print(f"  n_trades < 1:           {inv['bad_n']}")
+            print(f"  volume <= 0:            {inv['bad_vol']}")
+            ok = (inv["bad_high"] == 0 and inv["bad_low"] == 0
+                  and inv["bad_n"] == 0 and inv["bad_vol"] == 0)
+            print(f"  ALL INVARIANTS OK: {ok}")
+
+            # Determinism fingerprint — md5 over the canonical bar fields
+            cur.execute("""
+                SELECT md5(string_agg(
+                    bar_open_ts::text  || '|' || bar_close_ts::text || '|' ||
+                    open::text  || '|' || high::text  || '|' ||
+                    low::text   || '|' || close::text || '|' ||
+                    volume::text || '|' || n_trades::text || '|' ||
+                    cusum_pos::text || '|' || cusum_neg::text,
+                    chr(10) ORDER BY bar_id
+                )) AS h
+                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+            """, (threshold,))
+            print(f"\n--- Determinism fingerprint ---")
+            print(f"  md5(bars) = {cur.fetchone()['h']}")
+            print(f"  (compare to a future re-run's value to verify identity)")
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="bars.cusum")
     p.add_argument("--month", metavar="YYYY-MM",
@@ -339,6 +491,8 @@ def main(argv: list[str]) -> int:
             dry_run=args.dry_run,
         )
         print_summary(stats)
+        if not args.dry_run:
+            sanity_report(threshold)
     finally:
         close_pool()
     return 0
