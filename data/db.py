@@ -154,8 +154,7 @@ CREATE TABLE IF NOT EXISTS events.bars_btc_cusum (
     cusum_pos     DOUBLE PRECISION,
     cusum_neg     DOUBLE PRECISION,
     threshold_pct DOUBLE PRECISION NOT NULL,
-    PRIMARY KEY (bar_id, bar_close_ts),
-    UNIQUE (bar_close_ts, threshold_pct)
+    PRIMARY KEY (bar_id, bar_close_ts)
 );
 """
 

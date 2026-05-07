@@ -5,6 +5,118 @@
 
 ---
 
+## 2026-05-07 — Decision v3.0.6 — Drop UNIQUE(bar_close_ts, threshold_pct) on bars_btc_cusum (DR)
+
+**Context**: DR v3.0.5 STEP "full sweep" failed at the bulk INSERT step
+after a 6.5-hour clean scan (3.87B ticks → 18,629 bars → 0 force-closed):
+
+    psycopg.errors.UniqueViolation: duplicate key value violates unique
+    constraint "bars_btc_cusum_bar_close_ts_threshold_pct_key"
+    DETAIL:  Key (bar_close_ts, threshold_pct)=
+        (2019-06-26 20:35:08.818+00, 0.02) already exists.
+    CONTEXT:  COPY bars_btc_cusum, line 894
+
+Diagnostic (`--dry-run --month 2019-06`): 512 bars total, 7 close_ts
+values shared by >1 bar (8 extra bars from duplication). All cluster on
+2019-06-26 20:35 UTC during BTC's $13.8k → $12.6k flash crash. Sample
+triple-bar at `20:35:08.818000+00:00`:
+
+  - bar 1: 20:35:03.437 → 20:35:08.818, 1,691 ticks, $13340→$13134
+  - bar 2: 20:35:08.818 → 20:35:08.818, 1,095 ticks, $13134→$12873
+  - bar 3: 20:35:08.818 → 20:35:08.818,   663 ticks, $12871→$12644
+
+Bars 2 and 3 each contain hundreds of aggregate trades, all stamped to
+the same ts (Binance matcher's sub-µs sequencing during cascades). Each
+is a legitimate, ordered, distinct CUSUM crossing — real microstructure,
+not an algorithm artifact.
+
+State at failure: bars table empty (atomic DELETE+COPY rolled back as
+designed). Re-run required.
+
+**Decisions**:
+
+### 1. Drop UNIQUE(bar_close_ts, threshold_pct)
+
+```sql
+ALTER TABLE events.bars_btc_cusum
+DROP CONSTRAINT bars_btc_cusum_bar_close_ts_threshold_pct_key;
+```
+
+Update `_DDL_BARS_BTC_CUSUM` in `data/db.py` to omit the UNIQUE clause.
+Bar identity is fully captured by `bar_id` alone (BIGSERIAL, part of
+the existing PK `(bar_id, bar_close_ts)`).
+
+### 2. Authorize spec §6.3 edit
+
+Remove the `UNIQUE(bar_close_ts, threshold_pct)` line from the §6.3
+schema and strip the now-trailing comma on `threshold_pct`. Same
+single-line spec-edit pattern as DR v3.0.5 §3 (diagram alignment).
+No semantic change to the spec body.
+
+### 3. Why safe
+
+- The atomic DELETE + COPY + commit semantics from DR v3.0.5 §1 already
+  prevent accidental double-insertion across rebuilds — the UNIQUE was
+  redundant defense.
+- `bar_id` PK provides unique identity per bar.
+- Bars sharing `bar_close_ts` are semantically valid: each is a
+  separate CUSUM crossing within a single ts grain. Ordering by
+  `(bar_close_ts, bar_id)` preserves chronology.
+
+### 4. Why NOT change the algorithm to coalesce same-ts bars
+
+Two alternatives considered and rejected:
+
+(a) Force the next bar's close to be strictly later than the previous
+    bar's close. Would artificially stretch bars during cascades —
+    losing the genuine microstructure the algorithm is detecting.
+(b) Coalesce same-ts emits into one larger bar. Loses the directional
+    information (e.g., the triple-bar cascade above is three separate
+    SHORT bars; coalesced into one would mask the magnitude of the move).
+
+The DB schema must accommodate the data the algorithm produces, not the
+other way around.
+
+### 5. Re-run cost; recovery options explicitly deferred
+
+The 6.5-hour scan must be repeated — the in-memory bars list was lost
+when the failed transaction rolled back the process. Two recovery
+options are deferred:
+
+- **Disk-backed parquet checkpoint** (write bars after scan, before
+  INSERT): user decision — UNIQUE violation was the realistic failure
+  mode; remaining modes (disk full, conn timeout, OOM) aren't well
+  mitigated by parquet anyway. 30-line code + permanent artifact-
+  lifecycle burden was a poor ratio for now.
+- **Per-month atomic commits** (mirror DR v3.0.2 §3 pattern for bars):
+  substantive contract change to DR v3.0.5 §1 ("full atomic rebuild").
+  Earns its place if a fourth failure surfaces during the re-run — new
+  DR before the fifth attempt.
+
+### 6. Bar-count target — there is no validated target
+
+The 18,629 bars from the failed-INSERT scan (≈6.96 bars/day across
+2019-01..2026-04) sits in the low end of Lessmann's qualitative 5–20
+bars/day range. The earlier "33k–47k extrapolation" was speculative:
+Lessmann's paper does not tabulate raw per-threshold bar counts for
+BTC CUSUM 2% in the figures we have; the 25–35k anchor attributed to
+him was an approximation, not a measured value. Treat the bar count
+from the next clean run as the empirical truth from our data, not a
+deviation requiring investigation. The post-sweep sanity report
+(`bars/cusum.py:sanity_report`) reports bar count + per-month density
+observationally, without comparing to any target.
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-07; one fold
+added (§6 bar-count honesty); checkpoint and per-month-commits options
+explicitly deferred per user direction.
+
+**References**: DR v3.0.5 §1 (atomic rebuild contract), spec §6.3
+(schema), failure log `logs/bars_full.log` (archived as
+`logs/bars_full.log.20260507-failed-uniqueviolation`), diagnostic
+dry-run on 2019-06.
+
+---
+
 ## 2026-05-07 — Decision v3.0.5 — Phase 0.2 CUSUM bar construction contract (DR)
 
 **Context**: Phase 0.2 implements `bars/cusum.py` per spec §6.4 algorithm,

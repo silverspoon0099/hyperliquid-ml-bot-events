@@ -258,8 +258,7 @@ CREATE TABLE events.bars_btc_cusum (
     n_trades      INTEGER NOT NULL,
     cusum_pos     DOUBLE PRECISION,  -- S+ at close
     cusum_neg     DOUBLE PRECISION,  -- S- at close
-    threshold_pct DOUBLE PRECISION NOT NULL,
-    UNIQUE(bar_close_ts, threshold_pct)
+    threshold_pct DOUBLE PRECISION NOT NULL
 );
 SELECT create_hypertable('events.bars_btc_cusum', 'bar_close_ts');
 ```
