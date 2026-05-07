@@ -164,7 +164,7 @@ Local copy: `../TradingView/research/paper_springer.txt`. Full reference memory:
                           ┌──────────▼──────────┐
                           │  bars/cusum_bar.py  │
                           │  CUSUM filter 2%    │
-                          │  → bars_BTC.parquet │
+                          │  → events.bars_btc_cusum │
                           └──────────┬──────────┘
                                      │
                           ┌──────────▼──────────┐

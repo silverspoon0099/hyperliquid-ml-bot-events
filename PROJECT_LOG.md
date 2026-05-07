@@ -5,6 +5,181 @@
 
 ---
 
+## 2026-05-07 — Decision v3.0.5 — Phase 0.2 CUSUM bar construction contract (DR)
+
+**Context**: Phase 0.2 implements `bars/cusum.py` per spec §6.4 algorithm,
+writing into `events.bars_btc_cusum` per §6.3, with the §10.1-frozen
+CUSUM threshold of 0.02 for BTC. The spec leaves several mechanics
+unspecified — this DR pins them. The §10.1 frozen Phase A parameter
+(CUSUM threshold = 0.02) is NOT touched.
+
+**Decisions**:
+
+### 1. Resumability — full rebuild
+
+`bars/cusum.py` rebuilds the entire bar series from scratch on every
+run: `DELETE FROM events.bars_btc_cusum WHERE threshold_pct = :t` →
+single-pass tick scan → bulk INSERT. All in one transaction.
+
+Why rebuild over incremental:
+- Bar count is small (~25–35k for BTC over 6.5 yr per Lessmann); a
+  full rebuild on the existing 3.87B ticks runs once on Phase 0.2 pass,
+  then again only when ticks update or threshold changes.
+- Atomicity: DELETE + INSERT in one tx → no partial state if a crash
+  hits mid-run; same idempotency-by-rebuild discipline as the tick
+  loader's per-month tx (DR v3.0.2 §3 step 8).
+- Incremental is stateful (resume from `max(bar_close_ts)`, recover
+  in-flight `s_pos`/`s_neg`), error-prone, and offers no payoff at
+  this scale.
+
+For Phase B (multi-asset / threshold sweep) this becomes
+"per-(asset, threshold)" rebuild — same pattern, parameterized.
+
+### 2. Force-close bar marking — derived from cusum_pos / cusum_neg
+
+Per §6.5, a bar is force-closed when no 2% CUSUM move occurred in 168 h.
+The spec table already includes `cusum_pos` and `cusum_neg` at close;
+the close reason is recoverable:
+
+    close_reason = 'cusum'   if max(cusum_pos, -cusum_neg) >= threshold_pct
+                 = 'timeout' otherwise
+
+No schema change. Recoverable in one query:
+
+    SELECT bar_id,
+           CASE WHEN GREATEST(cusum_pos, -cusum_neg) >= threshold_pct
+                THEN 'cusum' ELSE 'timeout' END AS close_reason
+    FROM events.bars_btc_cusum;
+
+Rejected: adding `close_reason TEXT CHECK IN ('cusum','timeout')`. The
+extra column is explicit but spec-divergent for negligible benefit at
+~30k rows.
+
+### 3. Output destination — DB only
+
+`events.bars_btc_cusum` is canonical (per §6.3). The §5.1 ASCII diagram
+mention of `bars_BTC.parquet` is illustrative; parquet snapshot is
+NOT produced in Phase 0.2.
+
+**Spec edit authorized**: §5.1 ASCII diagram annotation
+`→ bars_BTC.parquet` is updated to `→ events.bars_btc_cusum` in the
+same commit as this DR. No semantic change to the spec body — pure
+annotation alignment to the §6.3 contract.
+
+### 4. Streaming pattern — `COPY (...) TO STDOUT (FORMAT BINARY)` + Python CUSUM loop
+
+3.87B ticks cannot be loaded into RAM. Read pattern:
+
+```python
+with cur.copy(
+    "COPY (SELECT ts, price, qty FROM events.ticks_btc "
+    "ORDER BY ts, agg_id) TO STDOUT (FORMAT BINARY)"
+) as copy:
+    copy.set_types(["timestamptz", "float8", "float8"])
+    builder = CusumBuilder(threshold, max_duration_h=168)
+    for ts, price, qty in copy.rows():
+        bar = builder.step(ts, price, qty)
+        if bar is not None:
+            bars.append(bar)
+```
+
+Why COPY over server-side cursor: ~2–3× faster on bulk reads, simpler
+loop, no cursor housekeeping. Single linear pass, monotonic stateful
+iteration. Bars are accumulated in an in-memory Python list (~30k rows
+× ~12 cols ≈ a few MB) and bulk-inserted via binary `COPY ... FROM
+STDIN` at end of scan, inside the same DELETE+INSERT transaction.
+
+If pure-Python iteration over 3.87B rows proves too slow in practice
+(likely 1–3 hours), `numba @njit` on the inner loop is a drop-in
+optimization — defer until measurement justifies.
+
+### 5. Warmup — none at bar stage
+
+Bar construction emits every bar from the first tick onward. The
+[config.yaml:58](config.yaml#L58) `warmup_bars: 100` parameter belongs
+to feature engineering (§7) — the feature builder drops the first 100
+bars to absorb its EMA/MACD/RSI ramp-up. Bar construction itself has
+no warmup; the first bar takes however many ticks are needed for
+either CUSUM ≥ 0.02 or 168 h to elapse.
+
+### 6. Tick ordering — `ORDER BY ts, agg_id`
+
+§6.5 demands bit-identical output across re-runs. Tick `ts` is not
+strictly monotonic — sub-microsecond timestamps collide (sample from
+2026-02: agg_id 3856672511 had ts=00:00:00.008822, multiple ticks
+within the same `ts` value are routine). Tie-break on `agg_id` ASC.
+`(ts, agg_id)` is unique by construction (the table's PK columns), so
+ordering is total and deterministic.
+
+### 7. Volume semantic — `SUM(qty)` (base-asset BTC)
+
+Spec §6.3 column `volume DOUBLE PRECISION` is ambiguous. Decision:
+volume is base-asset units (BTC), i.e. `SUM(qty)` over the bar's
+ticks. Matches Lessmann §"Bar construction"; matches the v2.0 30m
+project; quote-asset (USDT) volume is recoverable as `SUM(quote_qty)`
+from a JOIN if ever needed.
+
+### 8. Bars hypertable — chunk_interval 180 days; PK includes partitioning column
+
+[config.yaml:18](config.yaml#L18) sets `chunk_interval_bars: "180 days"`,
+which conflicts with §6.3's default-7-days `create_hypertable` call.
+For ~30k total bars over 6.5 yr (~13 chunks at 180 d vs ~340 chunks at
+7 d), 180-day chunks are appropriate. Pass
+`chunk_time_interval => INTERVAL '180 days'` explicitly.
+
+PK in §6.3 spec is `bar_id` alone, but Timescale requires the
+partitioning column in every uniqueness constraint. Use
+`PRIMARY KEY (bar_id, bar_close_ts)` — same pattern we used for
+`events.ticks_btc` PK `(agg_id, ts)` in DR v3.0.2 §1. The
+`UNIQUE(bar_close_ts, threshold_pct)` from the spec is preserved
+unchanged (already includes `bar_close_ts`).
+
+Compression policy for bars: defer to Phase 0.3+. Bars table is
+small enough that compression isn't load-bearing.
+
+### Implementation surface (informational, not a contract)
+
+- `data/db.py`: extend `init_schema()` to also create
+  `events.bars_btc_cusum` and the bars hypertable per §8. Signature
+  renamed: `init_schema(chunk_interval_ticks, compress_after_ticks,
+  chunk_interval_bars)` — old generic `chunk_interval` parameter is
+  now ticks-specific by name. Two existing callers in `data/ingest_ticks.py`
+  updated.
+- `bars/cusum.py`: `CusumBuilder` class (stateful, testable) +
+  `cusum_bars(ticks_iter, threshold, max_duration_h)` generator +
+  `build_bars(threshold, month_filter, dry_run)` DB driver +
+  CLI: `python -m bars.cusum [--month YYYY-MM] [--dry-run]`.
+- `bars/tests/test_cusum.py`: pytest fixtures covering the agreed set:
+  empty input, single tick, threshold edge ≥, threshold edge < ε,
+  monotonic up, monotonic down, sideways force-close, mixed walk
+  invariants, reset after CUSUM-triggered close (asserts
+  `s_pos == s_neg == 0`), explicit OHLC/volume/n_trades, cusum_pos/neg
+  at close == trigger state, determinism (same input → identical bars).
+
+### Sanity checks (Phase 0.2 post-build)
+
+- Total bar count plausible: ~25k–40k (Lessmann anchor 25k–35k for BTC
+  CUSUM 2% over 6.5 yr — adjust upward for our extra year + the
+  high-vol 2022Q3–2023Q1 segment)
+- Median bars/day per regime: high-vol 2022Q3 → 20+/d; low-vol 2023Q2
+  → 3–5/d
+- All bars: `n_trades >= 1`, `high >= max(open,close)`, `low <=
+  min(open,close)`, `volume > 0`
+- Force-closed bars (max(cusum_pos, -cusum_neg) < threshold): all have
+  duration ≈ 168h (zero or few in well-traded BTC)
+- No bar duration > 168h
+- Determinism: re-run, compare row count + ordered hash → identical
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-07; all 8
+decisions accepted; one fold added (spec §5.1 diagram annotation
+update authorized in §3); test fixtures extended per user's add list.
+
+**References**: Spec §6.3, §6.4, §6.5, §10.1, §15;
+[config.yaml:48-53](config.yaml#L48-L53); DR v3.0.2 §1
+(events.ticks_btc — source); Lessmann §"CUSUM filter and range bars".
+
+---
+
 ## 2026-05-06 — Decision v3.0.4 — Loader fix: dedup Binance source-data duplicates (DR)
 
 **Context**: After DR v3.0.3 patched the multi-CSV archive case, STEP 3

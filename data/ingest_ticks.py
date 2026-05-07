@@ -583,8 +583,9 @@ def _print_checkpoint(after_month: str, cum_rows: int, cum_t: float) -> None:
 def run_ingest() -> None:
     cfg = load_config()
     init_schema(
-        chunk_interval=cfg["database"]["chunk_interval_ticks"],
-        compress_after=cfg["database"]["compress_after_ticks"],
+        chunk_interval_ticks=cfg["database"]["chunk_interval_ticks"],
+        compress_after_ticks=cfg["database"]["compress_after_ticks"],
+        chunk_interval_bars=cfg["database"]["chunk_interval_bars"],
     )
 
     binance_cfg = cfg["data"]["binance"]
@@ -644,8 +645,9 @@ def _run_single_month(month_str: str) -> int:
     """Smoke-test entry: ingest exactly one month, hard-fail on any error."""
     cfg = load_config()
     init_schema(
-        chunk_interval=cfg["database"]["chunk_interval_ticks"],
-        compress_after=cfg["database"]["compress_after_ticks"],
+        chunk_interval_ticks=cfg["database"]["chunk_interval_ticks"],
+        compress_after_ticks=cfg["database"]["compress_after_ticks"],
+        chunk_interval_bars=cfg["database"]["chunk_interval_bars"],
     )
 
     binance_cfg = cfg["data"]["binance"]

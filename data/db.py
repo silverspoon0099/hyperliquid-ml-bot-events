@@ -137,27 +137,61 @@ SELECT add_compression_policy(
 );
 """
 
+# DR v3.0.5 §8: bars table + hypertable. PK is (bar_id, bar_close_ts) — Timescale
+# requires the partitioning column in every uniqueness constraint, same pattern
+# as events.ticks_btc PK (agg_id, ts). UNIQUE(bar_close_ts, threshold_pct) per §6.3.
+_DDL_BARS_BTC_CUSUM = """
+CREATE TABLE IF NOT EXISTS events.bars_btc_cusum (
+    bar_id        BIGSERIAL,
+    bar_open_ts   TIMESTAMPTZ      NOT NULL,
+    bar_close_ts  TIMESTAMPTZ      NOT NULL,
+    open          DOUBLE PRECISION NOT NULL,
+    high          DOUBLE PRECISION NOT NULL,
+    low           DOUBLE PRECISION NOT NULL,
+    close         DOUBLE PRECISION NOT NULL,
+    volume        DOUBLE PRECISION NOT NULL,
+    n_trades      INTEGER          NOT NULL,
+    cusum_pos     DOUBLE PRECISION,
+    cusum_neg     DOUBLE PRECISION,
+    threshold_pct DOUBLE PRECISION NOT NULL,
+    PRIMARY KEY (bar_id, bar_close_ts),
+    UNIQUE (bar_close_ts, threshold_pct)
+);
+"""
+
+_DDL_BARS_HYPERTABLE = """
+SELECT create_hypertable(
+    'events.bars_btc_cusum', 'bar_close_ts',
+    chunk_time_interval => %s::interval,
+    if_not_exists => TRUE
+);
+"""
+
 
 def init_schema(
-    chunk_interval: str = "7 days",
-    compress_after: str = "30 days",
+    chunk_interval_ticks: str = "7 days",
+    compress_after_ticks: str = "30 days",
+    chunk_interval_bars: str = "180 days",
 ) -> None:
-    """Create schema + tables + hypertable + compression policy. Idempotent.
+    """Create schema + tables + hypertables + compression policy. Idempotent.
 
-    Defaults match config.yaml (DR v3.0.2 §2). Pass overrides only for tests.
+    Defaults match config.yaml (DR v3.0.2 §2 for ticks; DR v3.0.5 §8 for bars).
+    Pass overrides only for tests.
     """
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(_DDL_SCHEMA)
             cur.execute(_DDL_TICKS_BTC)
-            cur.execute(_DDL_HYPERTABLE, (chunk_interval,))
+            cur.execute(_DDL_HYPERTABLE, (chunk_interval_ticks,))
             cur.execute(_DDL_INGEST_LOG)
 
             cur.execute(_CHECK_COMPRESSION_ENABLED)
             if cur.fetchone() is None:
                 cur.execute(_DDL_ENABLE_COMPRESSION)
+            cur.execute(_DDL_COMPRESSION_POLICY, (compress_after_ticks,))
 
-            cur.execute(_DDL_COMPRESSION_POLICY, (compress_after,))
+            cur.execute(_DDL_BARS_BTC_CUSUM)
+            cur.execute(_DDL_BARS_HYPERTABLE, (chunk_interval_bars,))
         conn.commit()
 
 

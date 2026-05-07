@@ -1,0 +1,348 @@
+"""CUSUM event-bar construction (spec §6.4 + DR v3.0.5).
+
+Streams `events.ticks_btc` via COPY TO STDOUT (binary), runs the
+Lessmann CUSUM algorithm in pure Python, force-closes any bar that
+exceeds 168 h without a CUSUM trigger (§6.5 fail-safe), and bulk-INSERTs
+into `events.bars_btc_cusum`. Single transaction: DELETE → COPY-stream
+ticks → INSERT bars → commit. Per DR v3.0.5 §1, full rebuild semantics.
+
+CLI:
+    python -m bars.cusum                              # full rebuild
+    python -m bars.cusum --dry-run                    # full read+compute, no DB write
+    python -m bars.cusum --dry-run --month YYYY-MM    # smoke test on one month
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import math
+import sys
+import time
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Iterable, Iterator, Optional
+
+import yaml
+
+from data.db import close_pool, get_connection, init_schema
+
+LOG = logging.getLogger("bars.cusum")
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Bar dataclass — frozen for hashable equality (used by determinism test)
+# ─────────────────────────────────────────────────────────────────────
+@dataclass(slots=True, frozen=True)
+class Bar:
+    bar_open_ts: datetime
+    bar_close_ts: datetime
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+    n_trades: int
+    cusum_pos: float
+    cusum_neg: float
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CUSUM algorithm (DR v3.0.5 §1, §5–§7)
+# ─────────────────────────────────────────────────────────────────────
+class CusumBuilder:
+    """Stateful single-asset CUSUM bar builder.
+
+    Per spec §6.4 algorithm with §6.5 168-h force-close fail-safe. Tests
+    inspect `s_pos`/`s_neg`/`bar_open_ts` attributes to verify reset
+    semantics after a CUSUM-triggered close.
+    """
+
+    __slots__ = (
+        "threshold", "max_duration_s",
+        "s_pos", "s_neg",
+        "bar_open_ts", "bar_open_price",
+        "bar_high", "bar_low",
+        "bar_volume", "bar_n_trades",
+        "last_price", "tick_index",
+    )
+
+    def __init__(self, threshold: float, max_duration_h: float = 168.0):
+        self.threshold = threshold
+        self.max_duration_s = max_duration_h * 3600.0
+        self.s_pos = 0.0
+        self.s_neg = 0.0
+        self.bar_open_ts: Optional[datetime] = None
+        self.bar_open_price: Optional[float] = None
+        self.bar_high: Optional[float] = None
+        self.bar_low: Optional[float] = None
+        self.bar_volume: float = 0.0
+        self.bar_n_trades: int = 0
+        self.last_price: Optional[float] = None
+        self.tick_index: int = 0
+
+    def step(self, ts: datetime, price: float, qty: float) -> Optional[Bar]:
+        """Process one tick. Returns Bar if one closes, else None."""
+        if self.bar_open_ts is None:
+            self.bar_open_ts = ts
+            self.bar_open_price = price
+            self.bar_high = price
+            self.bar_low = price
+            self.bar_volume = qty
+            self.bar_n_trades = 1
+        else:
+            if price > self.bar_high:
+                self.bar_high = price
+            if price < self.bar_low:
+                self.bar_low = price
+            self.bar_volume += qty
+            self.bar_n_trades += 1
+
+        if self.tick_index > 0:
+            r = math.log(price / self.last_price)
+            self.s_pos = max(0.0, self.s_pos + r)
+            self.s_neg = min(0.0, self.s_neg + r)
+
+        self.last_price = price
+        self.tick_index += 1
+
+        triggered = max(self.s_pos, -self.s_neg) >= self.threshold
+        timeout = (ts - self.bar_open_ts).total_seconds() >= self.max_duration_s
+
+        if triggered or timeout:
+            bar = Bar(
+                bar_open_ts=self.bar_open_ts,
+                bar_close_ts=ts,
+                open=self.bar_open_price,
+                high=self.bar_high,
+                low=self.bar_low,
+                close=price,
+                volume=self.bar_volume,
+                n_trades=self.bar_n_trades,
+                cusum_pos=self.s_pos,
+                cusum_neg=self.s_neg,
+            )
+            self.s_pos = 0.0
+            self.s_neg = 0.0
+            self.bar_open_ts = None
+            return bar
+        return None
+
+
+def cusum_bars(
+    ticks: Iterable[tuple],
+    threshold: float,
+    max_duration_h: float = 168.0,
+) -> Iterator[Bar]:
+    """Generator producing bars from a tick iterable. Each tick is a
+    (ts: datetime, price: float, qty: float) tuple."""
+    builder = CusumBuilder(threshold, max_duration_h)
+    for ts, price, qty in ticks:
+        bar = builder.step(ts, price, qty)
+        if bar is not None:
+            yield bar
+
+
+# ─────────────────────────────────────────────────────────────────────
+# DB driver (DR v3.0.5 §1, §4)
+# ─────────────────────────────────────────────────────────────────────
+_BARS_INSERT_COPY = (
+    "COPY events.bars_btc_cusum "
+    "(bar_open_ts, bar_close_ts, open, high, low, close, volume, n_trades, "
+    " cusum_pos, cusum_neg, threshold_pct) "
+    "FROM STDIN WITH (FORMAT BINARY)"
+)
+
+_BARS_INSERT_TYPES = [
+    "timestamptz", "timestamptz",
+    "float8", "float8", "float8", "float8",
+    "float8", "int4",
+    "float8", "float8",
+    "float8",
+]
+
+
+def _ticks_query(month_filter: Optional[date]) -> str:
+    """Build the COPY-TO-STDOUT query body, optionally filtered to one month."""
+    where = ""
+    if month_filter is not None:
+        ms = month_filter.isoformat()
+        next_m = (
+            date(month_filter.year + 1, 1, 1)
+            if month_filter.month == 12
+            else date(month_filter.year, month_filter.month + 1, 1)
+        ).isoformat()
+        where = f"WHERE ts >= '{ms}'::timestamptz AND ts < '{next_m}'::timestamptz "
+    return (
+        "COPY (SELECT ts, price, qty FROM events.ticks_btc "
+        f"{where}ORDER BY ts, agg_id) TO STDOUT (FORMAT BINARY)"
+    )
+
+
+def build_bars(
+    threshold: float,
+    max_duration_h: float = 168.0,
+    month_filter: Optional[date] = None,
+    dry_run: bool = False,
+) -> dict:
+    """Build all bars for one threshold; return a stats dict.
+
+    If `month_filter` is set, restrict the source ticks to that calendar
+    month. If `dry_run` is True, do not touch the bars table — stream,
+    compute, and report only.
+    """
+    LOG.info(
+        "build_bars: threshold=%s max_duration_h=%s month=%s dry_run=%s",
+        threshold, max_duration_h,
+        f"{month_filter:%Y-%m}" if month_filter else "<all>",
+        dry_run,
+    )
+
+    bars: list[Bar] = []
+    builder = CusumBuilder(threshold, max_duration_h)
+    n_ticks = 0
+    t0 = time.perf_counter()
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            with cur.copy(_ticks_query(month_filter)) as copy:
+                copy.set_types(["timestamptz", "float8", "float8"])
+                for ts, price, qty in copy.rows():
+                    n_ticks += 1
+                    bar = builder.step(ts, price, qty)
+                    if bar is not None:
+                        bars.append(bar)
+        scan_s = time.perf_counter() - t0
+        LOG.info("scan complete: %d ticks → %d bars in %.1f s",
+                 n_ticks, len(bars), scan_s)
+
+        if not dry_run:
+            t1 = time.perf_counter()
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM events.bars_btc_cusum WHERE threshold_pct = %s",
+                    (threshold,),
+                )
+                deleted = cur.rowcount
+                with cur.copy(_BARS_INSERT_COPY) as cp:
+                    cp.set_types(_BARS_INSERT_TYPES)
+                    for b in bars:
+                        cp.write_row((
+                            b.bar_open_ts, b.bar_close_ts,
+                            b.open, b.high, b.low, b.close,
+                            b.volume, b.n_trades,
+                            b.cusum_pos, b.cusum_neg,
+                            threshold,
+                        ))
+            conn.commit()
+            write_s = time.perf_counter() - t1
+            LOG.info("DB write complete: deleted %d, inserted %d in %.1f s",
+                     deleted, len(bars), write_s)
+
+    return {
+        "threshold": threshold,
+        "n_ticks": n_ticks,
+        "n_bars": len(bars),
+        "scan_s": time.perf_counter() - t0,
+        "bars_sample_first": bars[:3],
+        "bars_sample_last": bars[-3:] if len(bars) > 3 else [],
+        "all_bars": bars,
+    }
+
+
+def print_summary(stats: dict) -> None:
+    print("\n========== bars/cusum.py summary ==========")
+    print(f"threshold:      {stats['threshold']}")
+    print(f"ticks scanned:  {stats['n_ticks']:,}")
+    print(f"bars produced:  {stats['n_bars']:,}")
+    print(f"scan time:      {stats['scan_s']:.1f}s")
+    if stats['n_ticks'] > 0 and stats['scan_s'] > 0:
+        rate = stats['n_ticks'] / stats['scan_s']
+        print(f"throughput:     {rate:,.0f} ticks/sec")
+
+    bars = stats["all_bars"]
+    if bars:
+        durations = [(b.bar_close_ts - b.bar_open_ts).total_seconds() for b in bars]
+        n_timeout = sum(
+            1 for b in bars
+            if max(b.cusum_pos, -b.cusum_neg) < stats["threshold"]
+        )
+        print(f"\nbar duration (sec): "
+              f"min={min(durations):.0f}  "
+              f"median={sorted(durations)[len(durations)//2]:.0f}  "
+              f"max={max(durations):.0f}")
+        print(f"force-closed (timeout) bars: {n_timeout} of {len(bars)}")
+
+    if stats["bars_sample_first"]:
+        print("\nfirst 3 bars:")
+        for b in stats["bars_sample_first"]:
+            print(_format_bar(b, stats["threshold"]))
+    if stats["bars_sample_last"]:
+        print("\nlast 3 bars:")
+        for b in stats["bars_sample_last"]:
+            print(_format_bar(b, stats["threshold"]))
+
+
+def _format_bar(b: Bar, threshold: float) -> str:
+    duration = (b.bar_close_ts - b.bar_open_ts).total_seconds()
+    trigger = "cusum" if max(b.cusum_pos, -b.cusum_neg) >= threshold else "timeout"
+    return (
+        f"  {b.bar_open_ts} → {b.bar_close_ts}  dur={duration:.0f}s  trigger={trigger}\n"
+        f"     OHLC=({b.open:.2f}, {b.high:.2f}, {b.low:.2f}, {b.close:.2f})  "
+        f"vol={b.volume:.4f} n={b.n_trades}  "
+        f"S+={b.cusum_pos:+.4f} S-={b.cusum_neg:+.4f}"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────
+# CLI entry point
+# ─────────────────────────────────────────────────────────────────────
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="bars.cusum")
+    p.add_argument("--month", metavar="YYYY-MM",
+                   help="Limit ticks to one calendar month (smoke / debug).")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Stream + compute + print; no DB writes.")
+    args = p.parse_args(argv[1:])
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    cfg = load_config()
+    threshold = cfg["bars"]["threshold"]["BTC"]
+    max_duration_h = cfg["bars"]["max_bar_duration_hours"]
+
+    init_schema(
+        chunk_interval_ticks=cfg["database"]["chunk_interval_ticks"],
+        compress_after_ticks=cfg["database"]["compress_after_ticks"],
+        chunk_interval_bars=cfg["database"]["chunk_interval_bars"],
+    )
+
+    month_filter: Optional[date] = None
+    if args.month:
+        month_filter = date.fromisoformat(args.month + "-01")
+
+    try:
+        stats = build_bars(
+            threshold=threshold,
+            max_duration_h=max_duration_h,
+            month_filter=month_filter,
+            dry_run=args.dry_run,
+        )
+        print_summary(stats)
+    finally:
+        close_pool()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
