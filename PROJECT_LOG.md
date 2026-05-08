@@ -5,6 +5,191 @@
 
 ---
 
+## 2026-05-07 — Decision v3.0.7 — Phase 0.3 feature builder contract (DR)
+
+**Context**: Phase 0.3 implements `features/builder.py` per spec §7.1
+(replicate Lessmann's 33-feature set), reading from
+`events.bars_btc_cusum` and writing to parquet. Spec leaves several
+mechanics unspecified — this DR pins them. The §7.2-frozen 33-feature
+list is NOT modified, only its concrete column names + semantics.
+
+**Decisions**:
+
+### 1. Output destination — parquet only
+
+`data/storage/features/features_btc.parquet`. Per spec §15 +
+config.yaml:59. At 18,629 × 35 cols × float64 ≈ 5 MB, the DB pays
+hypertable overhead for no downstream benefit. Per-asset filename
+matches future Phase B SOL/LINK pattern.
+
+### 2. Builder produces RAW features only
+
+Per-fold z-score standardization (spec §7.1) is a trainer concern
+(`cv/walk_forward.py` Phase 1). Builder writes raw, unstandardized.
+
+### 3. Warmup handling — NaN at builder, filter at trainer
+
+Indicator implementations return NaN for early bars before each
+indicator ramps up. Builder writes NaN through; trainer drops the
+first 100 bars per config.yaml:58 `features.warmup_bars: 100`.
+Rejected: forward-fill (loses info), builder-side drop (couples warmup
+to wrong stage).
+
+### 4. "EMA + std" — std of CLOSE over the same N-period window
+
+`pandas.Series.rolling(N).std()` on close prices — NOT std of EMA
+values. Lessmann pairs an EMA trend measure with a rolling-volatility
+measure of the underlying.
+
+### 5. Exact 33 feature names (snake_case)
+
+| # | Name | Input | Source / formula |
+|---|------|-------|------------------|
+| 1–5  | ema_{5,10,15,20,50} | close | EMA, α = 2/(N+1) |
+| 6–10 | std_{5,10,15,20,50} | close | `close.rolling(N).std()` |
+| 11   | macd_line   | close | EMA(12) − EMA(26) |
+| 12   | macd_signal | close | EMA(9) of macd_line |
+| 13   | macd_hist   | close | macd_line − macd_signal |
+| 14–16 | rsi_{6,10,14} | close | Wilder, α = 1/N |
+| 17   | stoch_k    | h,l,c   | %K(14) smoothed by 3 |
+| 18   | stoch_d    | h,l,c   | SMA(3) of stoch_k |
+| 19   | williams_r | h,l,c   | −100 · (HH−c)/(HH−LL) over 14 |
+| 20   | bb_upper   | close   | SMA(5) + 2.0·std(5) |
+| 21   | bb_lower   | close   | SMA(5) − 2.0·std(5) |
+| 22   | ret_1      | close   | `np.log(close / close.shift(1))` |
+| 23   | cmf_21     | h,l,c,v | sum(MFV,21) / sum(v,21) |
+| 24   | mfi_14     | h,l,c,v | 100 − 100/(1+pos/neg) |
+| 25   | hour_sin   | bar_close_ts | sin(2π·h/24) |
+| 26   | hour_cos   | bar_close_ts | cos(2π·h/24) |
+| 27   | dow_sin    | bar_close_ts | sin(2π·d/7) |
+| 28   | dow_cos    | bar_close_ts | cos(2π·d/7) |
+| 29   | bar_duration_sec | open_ts/close_ts | `(close − open).total_seconds()` |
+| 30   | n_trades   | bars passthrough | (cast float64) |
+| 31   | volume     | bars passthrough | base-asset BTC, per DR v3.0.5 §7 |
+| 32   | cusum_pos  | bars passthrough | |
+| 33   | cusum_neg  | bars passthrough | |
+
+Plus 2 key columns prepended (NOT features, identifying):
+- `bar_id` — int64, BIGSERIAL from bars_btc_cusum
+- `bar_close_ts` — datetime64[ns, UTC]
+
+Total parquet schema: **35 columns** (2 keys + 33 features).
+
+### 6. sin/cos encoding
+
+```python
+h = bar_close_ts.hour          # 0..23
+d = bar_close_ts.weekday()     # 0=Mon .. 6=Sun (Python convention)
+hour_sin, hour_cos = sin(2π·h/24), cos(2π·h/24)
+dow_sin,  dow_cos  = sin(2π·d/7),  cos(2π·d/7)
+```
+
+`bar_close_ts` is the time anchor (not `bar_open_ts`) — the moment a
+bar's signal becomes available for action.
+
+### 7. dtype
+
+`bar_id`: int64. `bar_close_ts`: datetime64[ns, UTC]. All 33 features:
+float64 (including `n_trades` cast — keeps feature matrix homogeneous).
+
+### 8. Bar read order — `ORDER BY bar_close_ts, bar_id`
+
+bars_btc_cusum PK is `(bar_id, bar_close_ts)`; we read chronologically.
+`bar_id` is monotonic with insert order (BIGSERIAL during the rebuild)
+and matches `bar_close_ts` ordering for all but the same-ts cascade
+bars (DR v3.0.6); tie-breaking on `bar_id` gives a total deterministic
+order.
+
+### 9. Reproducibility — md5 fingerprint
+
+Same pattern as DR v3.0.6: at end of build, compute md5 over the
+canonicalized feature matrix (sorted by bar_id, all columns
+text-serialized) and log it. Re-runs produce identical fingerprints.
+
+### 10. pandas-ta — fallback (b) taken
+
+First attempt: `pandas-ta==0.3.14b0` against `numpy==2.1.3`.
+
+**Outcome (2026-05-07)**: pandas-ta is unavailable for our environment
+— `pandas-ta==0.3.14b0` is not on PyPI for Python 3.10.12, and the
+newer 0.4.x line (0.4.67b0, 0.4.71b0) requires Python ≥3.12.
+Per-user-decided fallback path **(b)** is taken: the 11 distinct
+indicator types (EMA / std / MACD / RSI-Wilder / Stoch / Williams %R /
+Bollinger / log-return / CMF / MFI / sin-cos seasonality) are
+implemented directly in `features/builder.py` using pandas + numpy
+(~150 lines total). `requirements.txt` does NOT include pandas-ta.
+
+The four golden-value tests (§13) validate the hand-rolled
+implementation against canonical formulas: RSI(14) Wilder, EMA(20)
+α=2/(N+1), MACD hist consistency, and BB symmetry.
+
+Rejected alternatives: (a) downgrading numpy is regressive — psycopg +
+future ML libs want 2.x; (c) coming-back-to-ask was avoidable since
+(b) is the only sensible long-term answer the user had pre-authorized.
+
+### 11. CLI surface
+
+```
+python -m features.builder                  # full build
+python -m features.builder --dry-run        # in-memory, print summary, no file
+python -m features.builder --month YYYY-MM  # smoke (single month)
+```
+
+Match the `bars.cusum` CLI shape.
+
+### 12. Sanity report (post-build)
+
+- 35 columns present, in the order specified above
+- Row count == bar count (18,629)
+- **Explicit assertion** (per user fold): `assert features_df.iloc[50:]
+  .isna().sum().sum() == 0` — NaN density drops to 0 after the longest
+  ramp (ema_50 / std_50, needs 50 bars). Catches silent ramp-up bugs.
+- Feature range plausibility: rsi ∈ [0, 100], williams_r ∈ [-100, 0],
+  sin/cos ∈ [-1, 1]
+- md5 fingerprint of the full matrix
+
+### 13. Test fixtures — synthetic + 4 golden-value/consistency tests
+
+Synthetic-OHLCV fixture set:
+- Expected shape (35 columns × N rows)
+- NaN counts at warmup edges
+- Indicator range plausibility
+- Determinism (run twice → identical output)
+
+Plus four golden-value / consistency tests (per user 2026-05-07 fold):
+- **RSI(14) golden**: hand-compute expected RSI at bars 14, 20, 25
+  from a deterministic synthetic close series; assert builder output
+  matches within float64 epsilon. RSI carries the highest definition-
+  drift risk (Wilder vs simple smoothing varies across libraries).
+- **EMA(20) golden**: hand-compute EMA at bars 20, 30, 40 with
+  α = 2/(N+1); assert match.
+- **MACD hist consistency**: assert `macd_hist == macd_line −
+  macd_signal` exactly (derived column; no float epsilon).
+- **BB symmetry**: assert `(bb_upper − sma_5) ≈ (sma_5 − bb_lower)`
+  within epsilon — symmetric ±2σ around the SMA-5 midpoint.
+
+These earn their place twice: catch pandas-ta version drift if path
+(a) is taken; validate the hand-rolled implementation against
+canonical formulas if path (b) is taken.
+
+### Implementation surface (informational, not a contract)
+
+- `features/builder.py`: indicator functions, `load_bars()`,
+  `build_features(bars_df)` returning the 35-column DataFrame,
+  `write_parquet(df)`, `sanity_report()`, CLI.
+- `features/tests/test_builder.py`: synthetic fixture set + 4 golden
+  tests above.
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-07; three
+folds: §12 explicit warmup assertion, §10 decided fallback path (b),
+§13 four golden-value tests.
+
+**References**: Spec §7.1, §7.2, §7.3, §15; config.yaml:57-69;
+DR v3.0.5 (bars source schema), DR v3.0.6 (sub-µs ordering);
+Lessmann §"Feature engineering".
+
+---
+
 ## 2026-05-07 — Decision v3.0.6 — Drop UNIQUE(bar_close_ts, threshold_pct) on bars_btc_cusum (DR)
 
 **Context**: DR v3.0.5 STEP "full sweep" failed at the bulk INSERT step
