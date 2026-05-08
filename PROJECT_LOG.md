@@ -5,6 +5,118 @@
 
 ---
 
+## 2026-05-08 — Decision v3.0.11 — TB sweep (§16.4 step 1) (DR)
+
+**Context**: After commit `2c71b43` (DR v3.0.10 threshold sweep) the
+state is:
+
+- Pre-gate 6/6 first-6 folds passed; model demonstrably learns
+- Threshold sweep characterized: 0.58 is the local economics optimum
+  (Sharpe nonzero +0.519 ≈ Lessmann's BTC anchor 0.51); lowering
+  threshold further DEGRADES per-trade economics
+- Aggregate Sharpe across all folds remains < 1.0 at every threshold;
+  Phase A pass gate (§16.1: Sharpe ≥ 1.0 mean, ≥ 75% folds positive)
+  is **NOT** met
+
+Per spec **§16.4 fallback ladder** for "Phase A passes pre-gate but
+Sharpe < 1.0":
+
+> *"(1) TB sweep first; (2) feature additions per §7.2; if still
+> fails → ship signal-provider mode"*
+
+This DR executes **step (1)**. Replicates the static-TB sensitivity
+analysis on our specific BTC tick stream rather than blindly accepting
+Lessmann's 5% as optimal for our data.
+
+**Decision**: Re-run the full 18-fold L0 walk-forward at five TB values
+**{0.03, 0.04, 0.05, 0.06, 0.07}** (symmetric tp/sl per spec §8.2;
+`vertical_bars=24` unchanged; default 0.60 confidence threshold per
+§10.1 unchanged). In-memory relabeling per TB value via
+`labels.triple_barrier.apply_triple_barrier(bars, tp, sl, 24)` — no
+disk parquet artifacts written for sweep variants.
+
+### Mechanics
+
+For each TB value t ∈ {0.03, 0.04, 0.05, 0.06, 0.07}:
+1. `apply_triple_barrier(bars_full, tp_pct=t, sl_pct=t, vertical_bars=24)`
+   → fresh labels DataFrame (in-memory only)
+2. Merge with features parquet on `bar_id`; drop UNLABELABLE
+3. Run the standard 18-fold L0 walk-forward (training, Platt
+   calibration on val, OOT prediction, backtest at default 0.60
+   confidence threshold)
+4. Aggregate per-TB metrics
+
+This is the §16.4-mandated step (1) execution. The §10.1 freeze on
+`tp/sl=0.05` stays in place; the sweep CHARACTERIZES the
+TB-vs-economics curve. Production change to TB requires a separate
+DR.
+
+### Output
+
+`reports/phase_1/tb_sweep.json`. Schema mirrors
+`threshold_sweep.json` (DR v3.0.10) for side-by-side comparison
+ergonomics:
+
+```json
+{
+  "tb_values_swept": [0.03, 0.04, 0.05, 0.06, 0.07],
+  "n_folds_total": 20,
+  "wall_clock_seconds": ...,
+  "by_tb": {
+    "0.03": {"aggregate": {n_trades_total, mean_pnl_bps_net,
+                            median_pnl_bps_net, win_pct_mean,
+                            long_win_pct_mean, short_win_pct_mean,
+                            sharpe_mean_across_folds, sharpe_std,
+                            sharpe_mean_nonzero_folds,
+                            n_folds_zero_trades,
+                            annual_return_mean},
+             "per_fold": [{fold, n_trades, sharpe, ...}, ...]},
+    "0.04": {...}, "0.05": {...}, "0.06": {...}, "0.07": {...}
+  }
+}
+```
+
+Sanity report: side-by-side aggregate table across all 5 TB values +
+per-fold n_trades by TB.
+
+### CLI
+
+```
+python -m scripts.run_phase_1_lgbm --tb-sweep
+```
+
+### Why safe (no test-set optimization, same discipline as v3.0.10)
+
+- Default tp/sl=0.05 in `config.yaml` and §10.1 freeze are unchanged
+- Sensitivity analysis to characterize the curve, not pick a winner
+- All TB values × all evaluated folds reported. No selection
+- Same purge/embargo, same training, same Platt, same threshold —
+  TB is the ONLY variable
+
+### Decision tree on the result (per user 2026-05-08 strategic message)
+
+| Outcome | Action |
+|---|---|
+| Any TB value yields Sharpe ≥ 0.7 with healthy per-trade economics (mean ≥ +40 bps, win% ≥ 55%) | §16.4 step (2): proceed to feature additions on BTC (HTF context, ATR percentile, pivot proximity, bars-since-event) per spec §7.2 |
+| All TB values stuck in Sharpe 0.4–0.6 range with no meaningful per-trade lift | Skip §7.2 features on BTC (low marginal hypothesis); go to user's strategic fork: **3a** ETH switch (~2 days) **OR** **3b** BTC signal-provider mode (~3 days) |
+| Mixed (one TB shows partial improvement, others don't) | Real conversation again before committing more time |
+
+**L1 ResNet-LSTM on BTC remains explicitly OFF the menu** — the
+threshold-sweep evidence (DR v3.0.10) weakens its marginal hypothesis;
+3-day commitment is not justified.
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-08 in
+strategic-checkpoint message; mechanics + TB values + output schema
+specified by user; in-memory relabeling per agent's implementation
+note (acknowledged).
+
+**References**: Spec §16.4 fallback ladder, §16.1 Phase A pass gate,
+§8.2 frozen Phase A labeling parameters, §10.1 frozen Phase A;
+DR v3.0.8 (labeler), DR v3.0.9 (L0 walk-forward), DR v3.0.10
+(threshold sweep — methodological precedent).
+
+---
+
 ## 2026-05-08 — Decision v3.0.10 — Confidence threshold sweep (sensitivity analysis) (DR)
 
 **Context**: Phase 1.0 L0 LightGBM full sweep result (commit `2003e06`):

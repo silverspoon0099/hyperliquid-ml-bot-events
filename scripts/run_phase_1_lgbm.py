@@ -70,6 +70,16 @@ def _load_bars_close() -> pd.DataFrame:
     return pd.read_sql_query(sql, get_engine())
 
 
+def _load_bars_ohlc() -> pd.DataFrame:
+    """Load full OHLC needed for in-memory relabeling (DR v3.0.11)."""
+    sql = """
+        SELECT bar_id, bar_open_ts, bar_close_ts, close, high, low
+        FROM events.bars_btc_cusum
+        ORDER BY bar_close_ts, bar_id
+    """
+    return pd.read_sql_query(sql, get_engine())
+
+
 def _md5_array(a: np.ndarray) -> str:
     return hashlib.md5(np.ascontiguousarray(a).tobytes()).hexdigest()
 
@@ -619,6 +629,214 @@ def print_threshold_sweep_report(out: dict) -> None:
     print("  'Sharpe (nonzero)' excludes folds where threshold filtered all signals.")
 
 
+def run_tb_sweep(
+    first_n: Optional[int] = None,
+    tb_values: tuple = (0.03, 0.04, 0.05, 0.06, 0.07),
+) -> dict:
+    """DR v3.0.11: §16.4 step (1) TB sweep. In-memory relabel per TB,
+    full L0 walk-forward at default 0.60 confidence threshold.
+    """
+    from labels.triple_barrier import apply_triple_barrier
+
+    cfg = _load_config()
+    wf = cfg["walk_forward"]
+    bt = cfg["backtest"]
+    lgbm_params = cfg["model"]["L0_lightgbm"]
+    confidence_threshold = cfg["model"]["signal_threshold"]  # default 0.60
+    cost_bps_round_trip = bt["costs_bps_round_trip"]
+    vertical_bars = cfg["labeling"]["vertical_bars"]
+
+    LOG.info("loading features + bars (with OHLC)...")
+    feats = _load_features()
+    bars_full = _load_bars_ohlc()
+    feature_cols = [c for c in feats.columns if c not in KEY_COLS]
+
+    data_start = date(bars_full["bar_close_ts"].min().year,
+                      bars_full["bar_close_ts"].min().month, 1)
+    data_end_ts = bars_full["bar_close_ts"].max()
+    if data_end_ts.month == 12:
+        data_end = date(data_end_ts.year + 1, 1, 1)
+    else:
+        data_end = date(data_end_ts.year, data_end_ts.month + 1, 1)
+
+    folds = generate_folds(
+        data_start=data_start, data_end=data_end,
+        initial_train_months=wf["initial_train_months"],
+        val_months=wf["val_months"], oot_months=wf["oot_months"],
+        step_months=wf["step_months"],
+    )
+    if first_n is not None:
+        folds = folds[:first_n]
+    LOG.info("folds=%d  TB values=%s", len(folds), list(tb_values))
+
+    by_tb: dict[str, dict] = {}
+    t0_total = time.perf_counter()
+
+    for tb in tb_values:
+        LOG.info("===== TB sweep value: tp=sl=%.2f =====", tb)
+        t_tb = time.perf_counter()
+
+        # In-memory relabel
+        labels_df = apply_triple_barrier(
+            bars_full[["bar_id", "bar_open_ts", "bar_close_ts", "close", "high", "low"]],
+            tp_pct=tb, sl_pct=tb, vertical_bars=vertical_bars,
+        )
+        df_full = feats.merge(labels_df, on="bar_id", how="inner")
+        df_full = df_full[df_full[LABEL_COL] != -1].copy()
+        df_full["label"] = df_full["label"].astype("int64")
+        df_full = df_full.sort_values(["bar_close_ts", "bar_id"]).reset_index(drop=True)
+
+        fold_rows = []
+        for fold in folds:
+            parts = split_fold(df_full, fold,
+                               purge_bars=wf["purge_bars"],
+                               embargo_bars=wf["embargo_bars"],
+                               ts_col="bar_close_ts")
+            train, val, oot = parts["train"], parts["val"], parts["oot"]
+            if len(val) < 100 or len(oot) < 100:
+                continue
+
+            booster = train_lgbm(
+                train[feature_cols], train[LABEL_COL].astype(int).values,
+                val[feature_cols], val[LABEL_COL].astype(int).values,
+                dict(lgbm_params),
+            )
+            val_raw = booster.predict(val[feature_cols])
+            cal = fit_platt(val_raw, val[LABEL_COL].astype(int).values, n_classes=3)
+            oot_raw = booster.predict(oot[feature_cols])
+            oot_cal = apply_platt(oot_raw, cal)
+
+            preds = pd.DataFrame({
+                "bar_id": oot["bar_id"].astype("int64").values,
+                "p_long":   oot_cal[:, 0],
+                "p_short":  oot_cal[:, 1],
+                "p_neutral": oot_cal[:, 2],
+            })
+            labels_oot = oot[["bar_id", "exit_bar_id", "exit_price",
+                              "exit_reason", "holding_bars", "label"]].copy()
+
+            trades = simulate_trades(
+                predictions=preds,
+                bars_df=bars_full[["bar_id", "bar_close_ts", "close"]],
+                labels_df=labels_oot,
+                confidence_threshold=confidence_threshold,
+                cost_bps_round_trip=cost_bps_round_trip,
+                max_concurrent=1,
+            )
+            eq = build_equity_curve(trades, starting_equity=10_000.0)
+            metrics = compute_metrics(trades, eq, oot_n_bars=len(oot))
+            mean_pnl = float(np.mean([t.pnl_bps_net for t in trades])) if trades else 0.0
+            median_pnl = float(np.median([t.pnl_bps_net for t in trades])) if trades else 0.0
+            n_long = sum(1 for t in trades if t.direction == 1)
+            n_short = sum(1 for t in trades if t.direction == -1)
+            n_long_win = sum(1 for t in trades if t.direction == 1 and t.pnl_bps_net > 0)
+            n_short_win = sum(1 for t in trades if t.direction == -1 and t.pnl_bps_net > 0)
+
+            fold_rows.append({
+                "fold": fold.fold_id, "n_oot": len(oot),
+                "n_trades": metrics["oot_n_trades"],
+                "n_long": n_long, "n_short": n_short,
+                "mean_pnl_bps_net": mean_pnl,
+                "median_pnl_bps_net": median_pnl,
+                "win_pct": metrics["oot_profitable_trade_pct"],
+                "long_win_pct": (n_long_win / n_long * 100.0) if n_long > 0 else 0.0,
+                "short_win_pct": (n_short_win / n_short * 100.0) if n_short > 0 else 0.0,
+                "sharpe": metrics["oot_sharpe"],
+                "sortino": metrics["oot_sortino"],
+                "max_dd": metrics["oot_max_dd"],
+                "annual_return": metrics["oot_annual_return"],
+            })
+
+        sharpes = [r["sharpe"] for r in fold_rows]
+        nonzero_sharpes = [s for s in sharpes if s != 0.0]
+        n_total_trades = sum(r["n_trades"] for r in fold_rows)
+        any_trade_folds = [r for r in fold_rows if r["n_trades"] > 0]
+        any_long_folds = [r for r in fold_rows if r["n_long"] > 0]
+        any_short_folds = [r for r in fold_rows if r["n_short"] > 0]
+
+        by_tb[f"{tb:.2f}"] = {
+            "aggregate": {
+                "n_trades_total": n_total_trades,
+                "trades_per_fold_mean": n_total_trades / max(len(fold_rows), 1),
+                "n_folds_with_trades": len(any_trade_folds),
+                "mean_pnl_bps_net": float(np.mean([r["mean_pnl_bps_net"] for r in any_trade_folds])) if any_trade_folds else 0.0,
+                "median_pnl_bps_net": float(np.median([r["median_pnl_bps_net"] for r in any_trade_folds])) if any_trade_folds else 0.0,
+                "win_pct_mean": float(np.mean([r["win_pct"] for r in any_trade_folds])) if any_trade_folds else 0.0,
+                "long_win_pct_mean": float(np.mean([r["long_win_pct"] for r in any_long_folds])) if any_long_folds else 0.0,
+                "short_win_pct_mean": float(np.mean([r["short_win_pct"] for r in any_short_folds])) if any_short_folds else 0.0,
+                "sharpe_mean_across_folds": float(np.mean(sharpes)) if sharpes else 0.0,
+                "sharpe_std": float(np.std(sharpes, ddof=1)) if len(sharpes) > 1 else 0.0,
+                "sharpe_mean_nonzero_folds": float(np.mean(nonzero_sharpes)) if nonzero_sharpes else 0.0,
+                "n_folds_zero_trades": sum(1 for r in fold_rows if r["n_trades"] == 0),
+                "annual_return_mean": float(np.mean([r["annual_return"] for r in fold_rows])) if fold_rows else 0.0,
+            },
+            "per_fold": fold_rows,
+        }
+        LOG.info("TB %.2f done in %.1fs: n_trades=%d sharpe(all)=%.3f sharpe(!=0)=%.3f",
+                 tb, time.perf_counter() - t_tb,
+                 n_total_trades,
+                 by_tb[f"{tb:.2f}"]["aggregate"]["sharpe_mean_across_folds"],
+                 by_tb[f"{tb:.2f}"]["aggregate"]["sharpe_mean_nonzero_folds"])
+
+    total_s = time.perf_counter() - t0_total
+    out = {
+        "tb_values_swept": list(tb_values),
+        "n_folds_total": len(folds),
+        "wall_clock_seconds": total_s,
+        "by_tb": by_tb,
+    }
+    out_path = PROJECT_ROOT / "reports" / "phase_1" / "tb_sweep.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out, indent=2, default=str))
+    LOG.info("wrote %s", out_path)
+    return out
+
+
+def print_tb_sweep_report(out: dict) -> None:
+    print("\n========== Phase 1.0 — TB Sweep (DR v3.0.11, §16.4 step 1) ==========")
+    print(f"Folds total: {out['n_folds_total']}")
+    print(f"Wall clock:  {out['wall_clock_seconds']:.1f}s")
+    print(f"TB values swept: {out['tb_values_swept']}")
+
+    print("\n--- Side-by-side aggregates (default 0.60 confidence threshold) ---")
+    header = (f"  {'TB':>5}  {'n_trd':>6}  {'tr/fld':>7}  {'0-tr':>5}  "
+              f"{'mPnL':>9}  {'medPnL':>10}  {'win%':>6}  "
+              f"{'L_win%':>7}  {'S_win%':>7}  {'Shp_all':>8}  {'Shp_!=0':>8}  {'annret':>7}")
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for tb in out["tb_values_swept"]:
+        a = out["by_tb"][f"{tb:.2f}"]["aggregate"]
+        print(f"  {tb:>5.2f}  "
+              f"{a['n_trades_total']:>6}  "
+              f"{a['trades_per_fold_mean']:>7.1f}  "
+              f"{a['n_folds_zero_trades']:>5}  "
+              f"{a['mean_pnl_bps_net']:>+9.2f}  "
+              f"{a['median_pnl_bps_net']:>+10.2f}  "
+              f"{a['win_pct_mean']:>6.1f}  "
+              f"{a['long_win_pct_mean']:>7.1f}  "
+              f"{a['short_win_pct_mean']:>7.1f}  "
+              f"{a['sharpe_mean_across_folds']:>+8.3f}  "
+              f"{a['sharpe_mean_nonzero_folds']:>+8.3f}  "
+              f"{a['annual_return_mean']:>+7.3f}")
+
+    print("\n--- Per-fold n_trades by TB ---")
+    if out["tb_values_swept"]:
+        first_tb_str = f"{out['tb_values_swept'][0]:.2f}"
+        fold_ids = [r["fold"] for r in out["by_tb"][first_tb_str]["per_fold"]]
+        print(f"  fold  " + "  ".join(f"TB={tb:.2f}" for tb in out["tb_values_swept"]))
+        for i, fold_id in enumerate(fold_ids):
+            row = []
+            for tb in out["tb_values_swept"]:
+                n = out["by_tb"][f"{tb:.2f}"]["per_fold"][i]["n_trades"]
+                row.append(f"{n:>6}")
+            print(f"  {fold_id:>4}  " + "  ".join(row))
+
+    print("\n--- Interpretation note ---")
+    print("  Confidence threshold fixed at 0.60 (default per §10.1).")
+    print("  Per-fold Sharpe is high-variance for thin OOT (~90 daily returns)")
+    print("  per 3-month window). Mean across folds is the meaningful aggregate.")
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="run_phase_1_lgbm")
     p.add_argument("--first-n", type=int, default=None,
@@ -628,6 +846,9 @@ def main(argv: list[str]) -> int:
     p.add_argument("--threshold-sweep", action="store_true",
                    help="DR v3.0.10: sensitivity analysis across "
                         "{0.50, 0.52, 0.55, 0.58, 0.60} confidence thresholds.")
+    p.add_argument("--tb-sweep", action="store_true",
+                   help="DR v3.0.11: §16.4 step (1) — sensitivity analysis "
+                        "across TB ∈ {0.03, 0.04, 0.05, 0.06, 0.07}.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -636,7 +857,10 @@ def main(argv: list[str]) -> int:
     )
 
     try:
-        if args.threshold_sweep:
+        if args.tb_sweep:
+            out = run_tb_sweep(first_n=args.first_n)
+            print_tb_sweep_report(out)
+        elif args.threshold_sweep:
             out = run_threshold_sweep(first_n=args.first_n)
             print_threshold_sweep_report(out)
         else:
