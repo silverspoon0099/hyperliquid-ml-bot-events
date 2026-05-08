@@ -5,6 +5,114 @@
 
 ---
 
+## 2026-05-08 — Decision v3.0.10 — Confidence threshold sweep (sensitivity analysis) (DR)
+
+**Context**: Phase 1.0 L0 LightGBM full sweep result (commit `2003e06`):
+
+- Pre-gate: 6/6 first-6 folds passed (ratios 0.91–0.96 < 0.99)
+- Per-trade economics: **positive** — mean +45.96 bps net, median +287.75 bps,
+  55.4% net winners across 92 trades; LONG side 59.0% win at +73.8 bps mean
+- Aggregate OOT Sharpe: -0.091 ± 1.18 (noise-dominated)
+- 13 of 18 folds produced 0 trades → 0.49% of bars traded
+
+The Sharpe-near-zero is a daily-resample artifact: equity curve is flat
+~99.5% of days → tiny daily mean / tiny daily std → noise-dominated
+ratio. Lessmann's BTC Sharpe 0.51 was achieved at ~20–25% time in market
+(many trades smoothing the curve); we have 0.5%.
+
+The economically meaningful question is whether per-trade economics
+(+46 bps net, 55% win) survive at lower confidence thresholds. If yes,
+more trades raise Sharpe via N-scaling (~√N). If no, the 0.60 threshold
+IS the binding constraint and the model has hit its lift ceiling.
+
+**Decision**: Re-run the same 18-fold L0 sweep at confidence thresholds
+**{0.50, 0.52, 0.55, 0.58, 0.60}**. Same model, same features, same
+labels, same purge/embargo, same Platt calibration. Only the
+post-prediction trade-take rule changes per threshold.
+
+This is a **sensitivity analysis, NOT a deviation from the §10.1 freeze**.
+The 0.60 threshold remains the default. If a lower value is later chosen
+for production, that requires a separate DR. The purpose here is to
+characterize the threshold-vs-economics tradeoff with eyes open before
+deciding whether to commit ~3 days to L1 ResNet-LSTM.
+
+### Mechanics
+
+Per fold:
+1. Train LightGBM on TRAIN, fit Platt on VAL (unchanged).
+2. Predict OOT raw probs → apply Platt → calibrated probs (unchanged).
+3. **For each threshold t in {0.50, 0.52, 0.55, 0.58, 0.60}**: run
+   `simulate_trades(preds, ..., confidence_threshold=t)` → compute
+   metrics → record under that threshold.
+
+Training is shared across thresholds (single LightGBM + Platt fit per
+fold); only backtest re-runs. Total cost ≈ original sweep + (5 × O(N)
+backtest passes) ≈ +1 minute over the ~3.4-min single-threshold run.
+
+### Output
+
+`reports/phase_1/threshold_sweep.json`. Per-threshold sub-dict:
+
+```json
+{
+  "thresholds_swept": [0.50, 0.52, 0.55, 0.58, 0.60],
+  "n_folds_evaluated": 18,
+  "by_threshold": {
+    "0.50": {
+      "aggregate": {
+        "n_trades_total": ..., "trades_per_fold_mean": ...,
+        "mean_pnl_bps_net": ..., "median_pnl_bps_net": ...,
+        "win_pct": ..., "long_win_pct": ..., "short_win_pct": ...,
+        "sharpe_mean_across_folds": ..., "sharpe_std": ...,
+        "annual_return_mean": ...
+      },
+      "per_fold": [{"fold": ..., "n_trades": ..., "sharpe": ...,
+                    "mean_pnl_bps_net": ..., "win_pct": ...}, ...]
+    },
+    "0.52": {...}, "0.55": {...}, "0.58": {...}, "0.60": {...}
+  }
+}
+```
+
+Sanity report: side-by-side comparison table across all 5 thresholds.
+
+### CLI
+
+```
+python -m scripts.run_phase_1_lgbm --threshold-sweep
+```
+
+Without the flag, existing single-threshold behavior is unchanged
+(the v3.0.9 default remains 0.60 from `config.yaml`).
+
+### Why safe (no test-set optimization)
+
+- Default threshold (0.60 per §10.1) is unchanged. Any production change
+  requires a separate DR.
+- We are CHARACTERIZING the curve, not picking a value. The L1 vs
+  signal-provider vs bail decision will be made on the curve's shape,
+  not on cherry-picking the best threshold's Sharpe.
+- All folds, all thresholds reported. No selection. The numbers are
+  what they are.
+
+### Decision tree on the sweep result
+
+| Outcome | Action |
+|---|---|
+| Lower threshold preserves +40+ bps per trade with 3-5× more trades | Strong signal; **GO L1 ResNet-LSTM** (Phase 1.1) |
+| Per-trade economics collapse at any threshold below 0.60 | **BAIL signal-provider mode** with default 0.60 model |
+| Mixed (e.g. economics drift but trades scale enough to net positive) | Real conversation again |
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-08 in
+strategic-checkpoint message; mechanics + thresholds + output schema
+specified by user.
+
+**References**: DR v3.0.7 (features), DR v3.0.8 (labels), DR v3.0.9
+(L0 walk-forward); commit `2003e06` (L0 baseline result); spec §8.4
+(confidence threshold), §10.1 (frozen Phase A parameters).
+
+---
+
 ## 2026-05-08 — Decision v3.0.9 — Phase 1.0 L0 LightGBM walk-forward contract (DR)
 
 **Context**: Phase 1.0 implements the L0 LightGBM walk-forward pre-gate

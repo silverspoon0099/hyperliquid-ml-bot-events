@@ -1,15 +1,20 @@
-"""Phase 1.0 L0 LightGBM walk-forward orchestrator (DR v3.0.9).
+"""Phase 1.0 L0 LightGBM walk-forward orchestrator (DR v3.0.9 + v3.0.10).
 
 Reads features + labels parquets, joins with bars (for close prices),
 generates folds, trains LightGBM per fold with Platt calibration on val,
 runs OOT backtest, writes per-fold artifacts + lgbm_results.json.
 
+DR v3.0.10 adds `--threshold-sweep` for sensitivity analysis across
+{0.50, 0.52, 0.55, 0.58, 0.60} confidence thresholds. Training is shared
+per fold; only the backtest re-runs per threshold.
+
 NO L1 ResNet-LSTM in this phase.
 
 CLI:
-    python -m scripts.run_phase_1_lgbm                  # full sweep
-    python -m scripts.run_phase_1_lgbm --first-n 3      # smoke (first 3 folds)
-    python -m scripts.run_phase_1_lgbm --dry-run        # build folds, no train
+    python -m scripts.run_phase_1_lgbm                    # full sweep, default threshold
+    python -m scripts.run_phase_1_lgbm --first-n 3        # smoke (first 3 folds)
+    python -m scripts.run_phase_1_lgbm --dry-run          # build folds, no train
+    python -m scripts.run_phase_1_lgbm --threshold-sweep  # DR v3.0.10 sensitivity
 """
 from __future__ import annotations
 
@@ -382,12 +387,247 @@ def print_sanity_report(out: dict) -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────
+def run_threshold_sweep(
+    first_n: Optional[int] = None,
+    thresholds: tuple = (0.50, 0.52, 0.55, 0.58, 0.60),
+) -> dict:
+    """DR v3.0.10: train once per fold, backtest 5 times across thresholds.
+
+    Output schema mirrors DR §"Output". Training shared per fold to avoid
+    re-fitting LightGBM 5×; only `simulate_trades` + metrics re-run per
+    threshold.
+    """
+    cfg = _load_config()
+    wf = cfg["walk_forward"]
+    bt = cfg["backtest"]
+    lgbm_params = cfg["model"]["L0_lightgbm"]
+    cost_bps_round_trip = bt["costs_bps_round_trip"]
+
+    LOG.info("loading features + labels + bars...")
+    feats = _load_features()
+    labels = _load_labels()
+    bars_close = _load_bars_close()
+
+    df_full = feats.merge(labels, on="bar_id", how="inner")
+    df_full = df_full[df_full[LABEL_COL] != -1].copy()
+    df_full["label"] = df_full["label"].astype("int64")
+    df_full = df_full.sort_values(["bar_close_ts", "bar_id"]).reset_index(drop=True)
+
+    feature_cols = [c for c in feats.columns if c not in KEY_COLS]
+
+    data_start = date(df_full["bar_close_ts"].min().year,
+                      df_full["bar_close_ts"].min().month, 1)
+    data_end_ts = df_full["bar_close_ts"].max()
+    if data_end_ts.month == 12:
+        data_end = date(data_end_ts.year + 1, 1, 1)
+    else:
+        data_end = date(data_end_ts.year, data_end_ts.month + 1, 1)
+
+    folds = generate_folds(
+        data_start=data_start, data_end=data_end,
+        initial_train_months=wf["initial_train_months"],
+        val_months=wf["val_months"], oot_months=wf["oot_months"],
+        step_months=wf["step_months"],
+    )
+    if first_n is not None:
+        folds = folds[:first_n]
+    LOG.info("folds=%d  thresholds=%s", len(folds), list(thresholds))
+
+    # Per-threshold accumulator: {thr: [per-fold dicts]}
+    by_threshold: dict[str, list[dict]] = {f"{t:.2f}": [] for t in thresholds}
+    n_evaluated = 0
+
+    t0_total = time.perf_counter()
+    for fold in folds:
+        parts = split_fold(df_full, fold,
+                           purge_bars=wf["purge_bars"],
+                           embargo_bars=wf["embargo_bars"],
+                           ts_col="bar_close_ts")
+        train, val, oot = parts["train"], parts["val"], parts["oot"]
+        n_train, n_val, n_oot = len(train), len(val), len(oot)
+
+        if n_val < 100 or n_oot < 100:
+            LOG.warning("Fold %d: SKIPPED (n_val=%d or n_oot=%d < 100)",
+                        fold.fold_id, n_val, n_oot)
+            continue
+        n_evaluated += 1
+
+        # Train + calibrate (shared across thresholds)
+        booster = train_lgbm(
+            train[feature_cols], train[LABEL_COL].astype(int).values,
+            val[feature_cols], val[LABEL_COL].astype(int).values,
+            dict(lgbm_params),
+        )
+        val_raw = booster.predict(val[feature_cols])
+        cal = fit_platt(val_raw, val[LABEL_COL].astype(int).values, n_classes=3)
+        oot_raw = booster.predict(oot[feature_cols])
+        oot_cal = apply_platt(oot_raw, cal)
+
+        preds = pd.DataFrame({
+            "bar_id": oot["bar_id"].astype("int64").values,
+            "p_long":   oot_cal[:, 0],
+            "p_short":  oot_cal[:, 1],
+            "p_neutral": oot_cal[:, 2],
+        })
+        labels_oot = oot[["bar_id", "exit_bar_id", "exit_price",
+                          "exit_reason", "holding_bars", "label"]].copy()
+
+        for thr in thresholds:
+            trades = simulate_trades(
+                predictions=preds, bars_df=bars_close, labels_df=labels_oot,
+                confidence_threshold=thr,
+                cost_bps_round_trip=cost_bps_round_trip,
+                max_concurrent=1,
+            )
+            eq = build_equity_curve(trades, starting_equity=10_000.0)
+            metrics = compute_metrics(trades, eq, oot_n_bars=n_oot)
+            n_trades = metrics["oot_n_trades"]
+            mean_pnl = float(np.mean([t.pnl_bps_net for t in trades])) if trades else 0.0
+            median_pnl = float(np.median([t.pnl_bps_net for t in trades])) if trades else 0.0
+            n_long = sum(1 for t in trades if t.direction == 1)
+            n_short = sum(1 for t in trades if t.direction == -1)
+            n_long_win = sum(1 for t in trades if t.direction == 1 and t.pnl_bps_net > 0)
+            n_short_win = sum(1 for t in trades if t.direction == -1 and t.pnl_bps_net > 0)
+
+            by_threshold[f"{thr:.2f}"].append({
+                "fold": fold.fold_id,
+                "n_oot": n_oot,
+                "n_trades": n_trades,
+                "n_long": n_long, "n_short": n_short,
+                "mean_pnl_bps_net": mean_pnl,
+                "median_pnl_bps_net": median_pnl,
+                "win_pct": metrics["oot_profitable_trade_pct"],
+                "long_win_pct": (n_long_win / n_long * 100.0) if n_long > 0 else 0.0,
+                "short_win_pct": (n_short_win / n_short * 100.0) if n_short > 0 else 0.0,
+                "sharpe": metrics["oot_sharpe"],
+                "sortino": metrics["oot_sortino"],
+                "max_dd": metrics["oot_max_dd"],
+                "annual_return": metrics["oot_annual_return"],
+                "pct_time_in_market": metrics["oot_pct_time_in_market"],
+            })
+        LOG.info("Fold %d: trained; backtested %d thresholds",
+                 fold.fold_id, len(thresholds))
+
+    total_s = time.perf_counter() - t0_total
+
+    # Per-threshold aggregates
+    results = {}
+    for thr_str, fold_rows in by_threshold.items():
+        if not fold_rows:
+            results[thr_str] = {"aggregate": {}, "per_fold": []}
+            continue
+        n_total_trades = sum(r["n_trades"] for r in fold_rows)
+        # Pool all per-trade PnLs (weighted by occurrence, not by fold)
+        all_pnl = []
+        for r in fold_rows:
+            if r["n_trades"] > 0:
+                all_pnl.extend([r["mean_pnl_bps_net"]] * r["n_trades"])
+        # Per-fold sharpe distribution
+        sharpes = [r["sharpe"] for r in fold_rows]
+        nonzero_sharpes = [s for s in sharpes if s != 0.0]
+        results[thr_str] = {
+            "aggregate": {
+                "n_trades_total": n_total_trades,
+                "trades_per_fold_mean": n_total_trades / len(fold_rows),
+                "trades_per_fold_median": float(np.median([r["n_trades"] for r in fold_rows])),
+                "n_folds_with_trades": sum(1 for r in fold_rows if r["n_trades"] > 0),
+                "mean_pnl_bps_net": float(np.mean([r["mean_pnl_bps_net"] for r in fold_rows
+                                                    if r["n_trades"] > 0])) if any(r["n_trades"] for r in fold_rows) else 0.0,
+                "median_pnl_bps_net": float(np.median([r["median_pnl_bps_net"] for r in fold_rows
+                                                        if r["n_trades"] > 0])) if any(r["n_trades"] for r in fold_rows) else 0.0,
+                "win_pct_mean": float(np.mean([r["win_pct"] for r in fold_rows
+                                                if r["n_trades"] > 0])) if any(r["n_trades"] for r in fold_rows) else 0.0,
+                "long_win_pct_mean": float(np.mean([r["long_win_pct"] for r in fold_rows
+                                                     if r["n_long"] > 0])) if any(r["n_long"] for r in fold_rows) else 0.0,
+                "short_win_pct_mean": float(np.mean([r["short_win_pct"] for r in fold_rows
+                                                      if r["n_short"] > 0])) if any(r["n_short"] for r in fold_rows) else 0.0,
+                "sharpe_mean_across_folds": float(np.mean(sharpes)),
+                "sharpe_std": float(np.std(sharpes, ddof=1)) if len(sharpes) > 1 else 0.0,
+                "sharpe_mean_nonzero_folds": float(np.mean(nonzero_sharpes)) if nonzero_sharpes else 0.0,
+                "n_folds_zero_trades": sum(1 for r in fold_rows if r["n_trades"] == 0),
+                "annual_return_mean": float(np.mean([r["annual_return"] for r in fold_rows])),
+            },
+            "per_fold": fold_rows,
+        }
+
+    out = {
+        "thresholds_swept": list(thresholds),
+        "n_folds_total": len(folds),
+        "n_folds_evaluated": n_evaluated,
+        "wall_clock_seconds": total_s,
+        "by_threshold": results,
+    }
+    out_path = PROJECT_ROOT / "reports" / "phase_1" / "threshold_sweep.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out, indent=2, default=str))
+    LOG.info("wrote %s", out_path)
+    return out
+
+
+def print_threshold_sweep_report(out: dict) -> None:
+    print("\n========== Phase 1.0 — Threshold Sweep (DR v3.0.10) ==========")
+    print(f"Folds total / evaluated: {out['n_folds_total']} / {out['n_folds_evaluated']}")
+    print(f"Wall clock: {out['wall_clock_seconds']:.1f}s")
+    print(f"Thresholds swept: {out['thresholds_swept']}")
+
+    print("\n--- Side-by-side aggregates ---")
+    cols = [
+        ("threshold",            lambda thr, a: f"{float(thr):.2f}"),
+        ("n_trades",             lambda thr, a: f"{a.get('n_trades_total', 0):>5}"),
+        ("trades/fold",          lambda thr, a: f"{a.get('trades_per_fold_mean', 0):>6.1f}"),
+        ("zero-trade folds",     lambda thr, a: f"{a.get('n_folds_zero_trades', 0):>4}"),
+        ("mean PnL (bps)",       lambda thr, a: f"{a.get('mean_pnl_bps_net', 0):>+8.2f}"),
+        ("median PnL (bps)",     lambda thr, a: f"{a.get('median_pnl_bps_net', 0):>+8.2f}"),
+        ("win%",                 lambda thr, a: f"{a.get('win_pct_mean', 0):>5.1f}"),
+        ("LONG win%",            lambda thr, a: f"{a.get('long_win_pct_mean', 0):>5.1f}"),
+        ("SHORT win%",           lambda thr, a: f"{a.get('short_win_pct_mean', 0):>5.1f}"),
+        ("Sharpe (all folds)",   lambda thr, a: f"{a.get('sharpe_mean_across_folds', 0):>+6.3f}"),
+        ("Sharpe (nonzero)",     lambda thr, a: f"{a.get('sharpe_mean_nonzero_folds', 0):>+6.3f}"),
+        ("ann. ret",             lambda thr, a: f"{a.get('annual_return_mean', 0):>+6.3f}"),
+    ]
+    header = f"  {'thr':>5}  {'n_trd':>6}  {'tr/fld':>7}  {'0-tr':>5}  {'mPnL':>9}  {'medPnL':>9}  {'win%':>6}  {'L_win%':>7}  {'S_win%':>7}  {'Shp_all':>8}  {'Shp_!=0':>8}  {'annret':>7}"
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for thr in out["thresholds_swept"]:
+        a = out["by_threshold"][f"{thr:.2f}"]["aggregate"]
+        print(f"  {thr:>5.2f}  "
+              f"{a.get('n_trades_total', 0):>6}  "
+              f"{a.get('trades_per_fold_mean', 0):>7.1f}  "
+              f"{a.get('n_folds_zero_trades', 0):>5}  "
+              f"{a.get('mean_pnl_bps_net', 0):>+9.2f}  "
+              f"{a.get('median_pnl_bps_net', 0):>+9.2f}  "
+              f"{a.get('win_pct_mean', 0):>6.1f}  "
+              f"{a.get('long_win_pct_mean', 0):>7.1f}  "
+              f"{a.get('short_win_pct_mean', 0):>7.1f}  "
+              f"{a.get('sharpe_mean_across_folds', 0):>+8.3f}  "
+              f"{a.get('sharpe_mean_nonzero_folds', 0):>+8.3f}  "
+              f"{a.get('annual_return_mean', 0):>+7.3f}")
+
+    print("\n--- Per-fold n_trades by threshold ---")
+    fold_ids = [r["fold"] for r in out["by_threshold"][f"{out['thresholds_swept'][0]:.2f}"]["per_fold"]]
+    print(f"  fold  " + "  ".join(f"{thr:>5.2f}" for thr in out["thresholds_swept"]))
+    for i, fold_id in enumerate(fold_ids):
+        row = []
+        for thr in out["thresholds_swept"]:
+            n = out["by_threshold"][f"{thr:.2f}"]["per_fold"][i]["n_trades"]
+            row.append(f"{n:>5}")
+        print(f"  {fold_id:>4}  " + "  ".join(row))
+
+    print("\n--- Interpretation note ---")
+    print("  Per-fold Sharpe is high-variance for thin OOT (~90 daily returns")
+    print("  per 3-month window). Mean across folds is the meaningful aggregate.")
+    print("  'Sharpe (nonzero)' excludes folds where threshold filtered all signals.")
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="run_phase_1_lgbm")
     p.add_argument("--first-n", type=int, default=None,
                    help="Smoke: run only the first N folds.")
     p.add_argument("--dry-run", action="store_true",
                    help="Build folds + report sample sizes, no training.")
+    p.add_argument("--threshold-sweep", action="store_true",
+                   help="DR v3.0.10: sensitivity analysis across "
+                        "{0.50, 0.52, 0.55, 0.58, 0.60} confidence thresholds.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -396,8 +636,12 @@ def main(argv: list[str]) -> int:
     )
 
     try:
-        out = run(first_n=args.first_n, dry_run=args.dry_run)
-        print_sanity_report(out)
+        if args.threshold_sweep:
+            out = run_threshold_sweep(first_n=args.first_n)
+            print_threshold_sweep_report(out)
+        else:
+            out = run(first_n=args.first_n, dry_run=args.dry_run)
+            print_sanity_report(out)
     finally:
         close_pool()
     return 0
