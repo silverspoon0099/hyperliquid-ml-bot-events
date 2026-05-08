@@ -5,6 +5,234 @@
 
 ---
 
+## 2026-05-08 — Decision v3.0.9 — Phase 1.0 L0 LightGBM walk-forward contract (DR)
+
+**Context**: Phase 1.0 implements the L0 LightGBM walk-forward pre-gate
+per spec §9.1, §9.2, §10.3, §10.4 + §11.1, §11.3, §11.5, §13. **NO L1
+ResNet-LSTM in this phase** — that decision is gated on the L0 result
+per the user's Phase A strategy. The §10.1-frozen parameters and §9.2
+LightGBM hyperparams are NOT touched.
+
+**Decisions**:
+
+### 1. Source — features ⨝ labels (⨝ bars for backtest) on bar_id
+
+Read `data/storage/features/features_btc.parquet` (18,629 × 35) and
+`data/storage/labels/labels_btc.parquet` (18,629 × 6). INNER JOIN on
+`bar_id`; drop rows where `label == -1` (UNLABELABLE; 24 rows). Yields
+18,605 labelable rows for train/val/OOT.
+
+For backtest (entry price), also load `events.bars_btc_cusum`
+(`bar_id, bar_close_ts, close`) — close is NOT a feature column in the
+features parquet (DR v3.0.7 §5). 3-way merge on `bar_id`.
+
+### 2. Walk-forward fold construction (calendar-anchored, expanding)
+
+Per spec §9.1 + config.yaml `walk_forward`:
+- `initial_train_months=24`, `val_months=3`, `oot_months=3`,
+  `step_months=3`
+- Train start fixed at 2019-01-01; train_end advances by 3 months per
+  fold; val and OOT slide forward.
+
+Fold N: train [2019-01-01, val_start), val [val_start, val_end),
+OOT [val_end, oot_end). Stop when oot_end > data_end (2026-05-01).
+Estimated ~20 folds.
+
+### 3. Purge / embargo (bar-count, applied within calendar boundaries)
+
+Per spec §9.1: `purge_bars = embargo_bars = 24` (= vertical_bars).
+- **Purge**: drop the last 24 train bars before val starts (their
+  labels' `exit_bar_id` could fall inside val).
+- **Embargo**: drop the first 24 OOT bars after val ends (those bars
+  could have been adjacent to val-fitted Platt scaler).
+
+### 4. Per-fold sample-size guard
+
+Skip a fold (logged warning, excluded from aggregate) if val OR OOT
+has < 100 labelable bars after purge/embargo. Worst-case 3-month
+window in our data (2025-Q3): 107 bars — should not trigger.
+
+### 5. Class weighting — default (no balancing)
+
+Class distribution 42.69 / 36.44 / 20.88 reflects natural BTC bull-
+market prior. Re-weighting biases the model AWAY from the prior;
+calibration (§6) corrects probability scale downstream.
+
+### 6. Probability calibration — Platt (sigmoid) on val fold
+
+Order:
+1. Train LightGBM on TRAIN with early-stopping on VAL (built-in eval)
+2. Predict VAL → raw probs; fit per-class one-vs-rest sigmoid
+   (`sklearn.linear_model.LogisticRegression`) on (raw_prob_k, y_val==k)
+3. Predict OOT → raw probs → apply per-class Platt → renormalize rows
+   to sum to 1
+4. Apply 0.60 confidence threshold (§8.4) for trade signal
+
+If a class has 0 examples in val, skip Platt for that class (use raw
+probs); flag in fold report.
+
+### 7. Pre-gate H(p) — train-fold class proportions
+
+Per spec §10.3:
+```
+ratio = val_logloss / H(p_train)
+H(p) = -Σ p_i · ln(p_i) over class proportions in TRAIN
+```
+
+Pre-gate passes for a fold if `ratio < 0.99`. Aggregate pass if
+**≥4 of first 6 folds** pass (per config.yaml `pre_gate.required_pass_folds`).
+
+### 8. Trading signal rule + position management
+
+Per §8.4 + §13:
+- `p_long > 0.60` → LONG at close[t]
+- `p_short > 0.60` → SHORT at close[t]
+- Else → no trade
+- **Max 1 concurrent position per asset** (§13). Signals that fire
+  while a prior position is still open (its `exit_bar_id` not yet
+  reached) are skipped.
+
+### 9. PnL via label exit_price; cost 11 bps round-trip
+
+Subtle: the **label's `exit_price` IS the trade outcome**, regardless
+of model prediction. The label was computed from the same triple-
+barrier rule the model is trained against:
+- predicted LONG, label LONG (TP) → win:  `+(exit/entry − 1)`
+- predicted LONG, label SHORT (SL) → loss: `+(exit/entry − 1)` ≈ −5%
+- predicted LONG, label NEUTRAL (timeout) → small win/loss: actual
+  price diff
+- predicted SHORT → mirror (sign flipped)
+
+Cost: 11 bps subtracted from each completed trade's return (spec §11.1).
+Position size: $10k fixed (spec §11.3).
+
+### 10. Sharpe — daily-resample equity curve × √252
+
+Per spec §11.5 + standard convention:
+1. Build equity curve `(timestamp, equity)` indexed by trade exit time
+2. Resample to daily, forward-fill between trades
+3. `Sharpe = mean(daily_log_ret) / std(daily_log_ret) × √252`
+
+Sortino: same but std → negative-side deviation. max_dd: peak-to-trough
+on equity. pct_time_in_market: Σ(holding_bars) / OOT_bar_count × 100.
+n_trades, profitable_trade_pct (net PnL > 0): direct counts.
+
+Comparable to Lessmann's BTC Sharpe 0.51 (after 20 bps; we use 11 bps
+so should land ≥ his on the same model architecture).
+
+### 11. No standardization for L0
+
+LightGBM is gradient-boosted trees → scale-invariant. Per-fold
+standardization is meaningful only for L1 ResNet-LSTM (Phase 1.1).
+L0 reads raw features from `features_btc.parquet` directly.
+
+### 12. Reproducibility — md5 fingerprints
+
+- Per-fold OOT predictions: md5 over calibrated-prob array
+- Aggregate JSON: contains md5 fingerprints + RNG seed (42, per §9.2)
+
+### 13. Output schema
+
+```
+reports/phase_1/
+├── lgbm_results.json          # aggregate + per-fold metrics
+├── fold_01/
+│   ├── equity_curve.csv       # ts, equity, position, signal
+│   ├── trades.csv             # entry/exit/direction/exit_reason/pnl
+│   └── predictions.parquet    # bar_id, p_long, p_short, p_neutral
+├── fold_02/...
+```
+
+`lgbm_results.json` per fold includes:
+- val_logloss, H(p_train), ratio, pre_gate_pass
+- oot_sharpe, oot_sortino, oot_max_dd, oot_pct_time_in_market,
+  oot_n_trades, oot_profitable_trade_pct, oot_annual_return
+- **feature_importance_top10** (per user 2026-05-08 fold (b)): list
+  of `{feature, gain, split}` ordered by `gain` descending; gain is
+  the loss-improvement contribution (more meaningful than split count)
+- oot_md5
+
+Aggregate: mean ± std across evaluated folds; pre-gate verdict
+(first-6 folds pass-count vs required).
+
+### 14. CLI surface
+
+```
+python -m scripts.run_phase_1_lgbm                  # full sweep
+python -m scripts.run_phase_1_lgbm --first-n 3      # smoke (first 3 folds)
+python -m scripts.run_phase_1_lgbm --dry-run        # build folds, no train
+```
+
+### 15. Sanity report
+
+Per-fold:
+- val_logloss / H(p_train), pre_gate pass/fail
+- Sample sizes (n_train, n_val, n_oot after purge/embargo)
+- OOT metrics per spec §10.4
+- Top-10 feature importance (gain)
+- LightGBM trees used (early-stopping)
+
+Aggregate:
+- mean ± std of each metric across evaluated folds
+- pre-gate verdict (k of first 6 passed; required ≥ 4)
+- **Interpretation note** (per user 2026-05-08 operational fold):
+  "Per-fold Sharpe is high-variance for thin OOT (~90 daily returns
+  per 3-month window). Mean across folds is the meaningful aggregate;
+  individual fold swings are not over-interpreted."
+
+### 16. Test fixtures
+
+- `cv/tests/test_walk_forward.py`: synthetic 60-month range → expected
+  fold count + boundaries; purge/embargo geometry on synthetic bars
+- `cv/tests/test_pre_gate.py`: hand-computed H(p); ratio at known
+  val_logloss; aggregate ≥4/6 logic
+- `model/tests/test_lgbm.py`: train with seed=42 twice → identical
+  predictions; Platt calibrated probs sum to 1.0; **leakage-detection
+  test** (per user 2026-05-08 fold (a)):
+    - inject synthetic `future_ret_5 = log(close[t+5]/close[t])`
+      feature
+    - train L0 with leak feature → assert val_logloss < 0.5 × H(p_train)
+      (pipeline lets the model use the leak; otherwise a different bug)
+    - train SAME pipeline without leak → assert val_logloss / H(p) > 0.7
+      (no leak means no implausibly low logloss)
+    - catches look-ahead in feature computation or full-dataset fit
+- `backtest/tests/test_runner.py`: synthetic trades → known equity
+  curve + Sharpe; cost application = 11 bps subtracted; no-trade bars
+  contribute 0; max 1 concurrent honored
+
+### 17. Decision tree at L0 result (per user 2026-05-08)
+
+After full sweep + sanity report lands, decide:
+
+| L0 outcome | Action |
+|---|---|
+| Pre-gate ≥4/6 AND OOT Sharpe mean ≥ 0.5 | Proceed to Phase 1.1 — L1 ResNet-LSTM |
+| Pre-gate ≤3/6 AND OOT Sharpe ≤ 0.2 | Bail to signal-provider mode; skip the L1 week |
+| Mixed (pre-gate passes but Sharpe 0.2-0.5, or vice versa) | STOP, send numbers, real conversation before more time |
+
+NO L1 implementation begins without explicit user GO after L0 numbers
+land.
+
+### Implementation surface (informational, not a contract)
+
+- `cv/__init__.py`, `cv/walk_forward.py`, `cv/pre_gate.py`
+- `model/__init__.py`, `model/lgbm.py`
+- `backtest/__init__.py`, `backtest/runner.py`
+- `scripts/__init__.py`, `scripts/run_phase_1_lgbm.py`
+- Tests for each module
+- requirements.txt: `lightgbm==4.5.0`, `scikit-learn==1.5.2`
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-08; two folds:
+(a) leakage-detection test, (b) per-fold top-10 feature importance.
+Operational note: per-fold Sharpe high-variance, interpret aggregate.
+
+**References**: Spec §9.1, §9.2, §10.3, §10.4, §11.1, §11.3, §11.5,
+§13; config.yaml:88-141; DR v3.0.7 (features), DR v3.0.8 (labels);
+Lessmann §"Detailed results", §"Experiment setup"; López de Prado
+2018 Ch. 7 (purge/embargo).
+
+---
+
 ## 2026-05-08 — Decision v3.0.8 — Phase 0.4 triple-barrier labeler contract (DR)
 
 **Context**: Phase 0.4 implements `labels/triple_barrier.py` per spec

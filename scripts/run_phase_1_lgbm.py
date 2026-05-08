@@ -1,0 +1,407 @@
+"""Phase 1.0 L0 LightGBM walk-forward orchestrator (DR v3.0.9).
+
+Reads features + labels parquets, joins with bars (for close prices),
+generates folds, trains LightGBM per fold with Platt calibration on val,
+runs OOT backtest, writes per-fold artifacts + lgbm_results.json.
+
+NO L1 ResNet-LSTM in this phase.
+
+CLI:
+    python -m scripts.run_phase_1_lgbm                  # full sweep
+    python -m scripts.run_phase_1_lgbm --first-n 3      # smoke (first 3 folds)
+    python -m scripts.run_phase_1_lgbm --dry-run        # build folds, no train
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import sys
+import time
+from dataclasses import asdict
+from datetime import date
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import yaml
+from sklearn.metrics import log_loss
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from cv.walk_forward import generate_folds, split_fold, Fold
+from cv.pre_gate import class_prior_entropy, pre_gate_ratio, aggregate_pre_gate
+from model.lgbm import train_lgbm, fit_platt, apply_platt, feature_importance_top_k
+from backtest.runner import (
+    simulate_trades, build_equity_curve, compute_metrics, trades_to_dataframe,
+)
+from data.db import close_pool, get_engine
+
+LOG = logging.getLogger("scripts.run_phase_1_lgbm")
+CONFIG_PATH = PROJECT_ROOT / "config.yaml"
+
+KEY_COLS = ["bar_id", "bar_close_ts"]
+LABEL_COL = "label"
+
+
+def _load_config() -> dict:
+    with open(CONFIG_PATH) as f:
+        return yaml.safe_load(f)
+
+
+def _load_features() -> pd.DataFrame:
+    return pd.read_parquet(PROJECT_ROOT / "data/storage/features/features_btc.parquet")
+
+
+def _load_labels() -> pd.DataFrame:
+    return pd.read_parquet(PROJECT_ROOT / "data/storage/labels/labels_btc.parquet")
+
+
+def _load_bars_close() -> pd.DataFrame:
+    sql = "SELECT bar_id, bar_close_ts, close FROM events.bars_btc_cusum ORDER BY bar_close_ts, bar_id"
+    return pd.read_sql_query(sql, get_engine())
+
+
+def _md5_array(a: np.ndarray) -> str:
+    return hashlib.md5(np.ascontiguousarray(a).tobytes()).hexdigest()
+
+
+def _md5_file(path: Path) -> str:
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _equity_curve_with_position(
+    trades: list, oot_bars: pd.DataFrame
+) -> pd.DataFrame:
+    """Build a sparse (ts, equity, position, signal) frame for §11.5."""
+    if not trades:
+        return pd.DataFrame(columns=["ts", "equity", "position", "signal"])
+    rows = []
+    starting_equity = 10_000.0
+    cur = starting_equity
+    rows.append({"ts": trades[0].entry_ts, "equity": cur,
+                 "position": 0, "signal": "init"})
+    for t in trades:
+        rows.append({"ts": t.entry_ts, "equity": cur,
+                     "position": t.direction,
+                     "signal": "LONG" if t.direction == 1 else "SHORT"})
+        cur *= 1.0 + t.pnl_bps_net / 10000.0
+        rows.append({"ts": t.exit_ts, "equity": cur,
+                     "position": 0, "signal": f"EXIT_{t.exit_reason}"})
+    return pd.DataFrame(rows)
+
+
+# ─────────────────────────────────────────────────────────────────────
+def run_fold(
+    fold: Fold,
+    df_full: pd.DataFrame,
+    bars_close: pd.DataFrame,
+    feature_cols: list[str],
+    lgbm_params: dict,
+    purge_bars: int,
+    embargo_bars: int,
+    confidence_threshold: float,
+    cost_bps_round_trip: float,
+    out_dir: Path,
+    dry_run: bool,
+) -> dict:
+    """Train + OOT backtest for one fold; returns the fold metrics dict."""
+    parts = split_fold(df_full, fold,
+                       purge_bars=purge_bars, embargo_bars=embargo_bars,
+                       ts_col="bar_close_ts")
+    train, val, oot = parts["train"], parts["val"], parts["oot"]
+    n_train, n_val, n_oot = len(train), len(val), len(oot)
+
+    res: dict = {
+        "fold": fold.fold_id,
+        "train_start": str(fold.train_start),
+        "val_start": str(fold.val_start),
+        "val_end": str(fold.val_end),
+        "oot_end": str(fold.oot_end),
+        "n_train": n_train, "n_val": n_val, "n_oot": n_oot,
+        "skipped": False,
+        "skip_reason": None,
+    }
+
+    if n_val < 100 or n_oot < 100:
+        res["skipped"] = True
+        res["skip_reason"] = f"n_val={n_val} or n_oot={n_oot} < 100 bars"
+        LOG.warning("Fold %d: SKIPPED (%s)", fold.fold_id, res["skip_reason"])
+        return res
+
+    if dry_run:
+        LOG.info("Fold %d: dry-run (would train on %d / val %d / oot %d)",
+                 fold.fold_id, n_train, n_val, n_oot)
+        return res
+
+    # ────── Train ──────
+    t0 = time.perf_counter()
+    booster = train_lgbm(
+        train[feature_cols], train[LABEL_COL].astype(int).values,
+        val[feature_cols], val[LABEL_COL].astype(int).values,
+        dict(lgbm_params),
+    )
+    train_s = time.perf_counter() - t0
+
+    # ────── Pre-gate (val_logloss / H(p_train)) ──────
+    val_raw = booster.predict(val[feature_cols])
+    val_ll = log_loss(val[LABEL_COL].astype(int).values, val_raw,
+                      labels=[0, 1, 2])
+    H_p = class_prior_entropy(train[LABEL_COL].astype(int).values, n_classes=3)
+    ratio = val_ll / H_p
+
+    # ────── Calibrate (Platt) on val raw → predict OOT ──────
+    cal = fit_platt(val_raw, val[LABEL_COL].astype(int).values, n_classes=3)
+    oot_raw = booster.predict(oot[feature_cols])
+    oot_cal = apply_platt(oot_raw, cal)
+
+    # ────── Backtest ──────
+    preds = pd.DataFrame({
+        "bar_id": oot["bar_id"].astype("int64").values,
+        "p_long":   oot_cal[:, 0],
+        "p_short":  oot_cal[:, 1],
+        "p_neutral": oot_cal[:, 2],
+    })
+
+    # labels_df subset for OOT bars
+    labels_oot = oot[["bar_id", "exit_bar_id", "exit_price",
+                      "exit_reason", "holding_bars", "label"]].copy()
+
+    trades = simulate_trades(
+        predictions=preds, bars_df=bars_close, labels_df=labels_oot,
+        confidence_threshold=confidence_threshold,
+        cost_bps_round_trip=cost_bps_round_trip,
+        max_concurrent=1,
+    )
+    eq_for_metrics = build_equity_curve(trades, starting_equity=10_000.0)
+    metrics = compute_metrics(trades, eq_for_metrics, oot_n_bars=n_oot)
+
+    # ────── Per-fold artifacts ──────
+    fold_dir = out_dir / f"fold_{fold.fold_id:02d}"
+    fold_dir.mkdir(parents=True, exist_ok=True)
+    eq_full = _equity_curve_with_position(trades, oot)
+    eq_full.to_csv(fold_dir / "equity_curve.csv", index=False)
+    trades_df = trades_to_dataframe(trades)
+    trades_df.to_csv(fold_dir / "trades.csv", index=False)
+    preds.to_parquet(fold_dir / "predictions.parquet", index=False)
+
+    # ────── Feature importance top-10 (gain) ──────
+    fi_top10 = feature_importance_top_k(booster, feature_cols, k=10)
+
+    res.update({
+        "val_logloss": float(val_ll),
+        "H_p_train": float(H_p),
+        "ratio": float(ratio),
+        "pre_gate_pass": bool(ratio < 0.99),
+        "trees_used": int(booster.best_iteration or booster.num_trees()),
+        "train_seconds": train_s,
+        **metrics,
+        "feature_importance_top10": fi_top10,
+        "oot_md5": _md5_array(oot_cal),
+    })
+    LOG.info(
+        "Fold %d: ratio=%.4f pass=%s sharpe=%.3f n_trades=%d trees=%d",
+        fold.fold_id, ratio, res["pre_gate_pass"],
+        metrics["oot_sharpe"], metrics["oot_n_trades"], res["trees_used"],
+    )
+    return res
+
+
+# ─────────────────────────────────────────────────────────────────────
+def run(
+    first_n: Optional[int] = None,
+    dry_run: bool = False,
+) -> dict:
+    cfg = _load_config()
+    wf = cfg["walk_forward"]
+    pg = cfg["pre_gate"]
+    bt = cfg["backtest"]
+    lgbm_params = cfg["model"]["L0_lightgbm"]
+    confidence_threshold = cfg["model"]["signal_threshold"]
+    cost_bps_round_trip = bt["costs_bps_round_trip"]
+
+    LOG.info("loading features + labels + bars...")
+    feats = _load_features()
+    labels = _load_labels()
+    bars_close = _load_bars_close()
+
+    df_full = feats.merge(labels, on="bar_id", how="inner")
+    df_full = df_full[df_full[LABEL_COL] != -1].copy()
+    df_full["label"] = df_full["label"].astype("int64")
+    df_full = df_full.sort_values(["bar_close_ts", "bar_id"]).reset_index(drop=True)
+    LOG.info("features+labels merged: %d labelable bars × %d cols",
+             len(df_full), len(df_full.columns))
+
+    feature_cols = [c for c in feats.columns if c not in KEY_COLS]
+    LOG.info("feature columns: %d (e.g. %s)", len(feature_cols), feature_cols[:3])
+
+    # Generate folds
+    data_start = date(df_full["bar_close_ts"].min().year,
+                      df_full["bar_close_ts"].min().month, 1)
+    data_end_ts = df_full["bar_close_ts"].max()
+    # Use the start of the month AFTER the last bar's month as data_end
+    if data_end_ts.month == 12:
+        data_end = date(data_end_ts.year + 1, 1, 1)
+    else:
+        data_end = date(data_end_ts.year, data_end_ts.month + 1, 1)
+
+    folds = generate_folds(
+        data_start=data_start, data_end=data_end,
+        initial_train_months=wf["initial_train_months"],
+        val_months=wf["val_months"],
+        oot_months=wf["oot_months"],
+        step_months=wf["step_months"],
+    )
+    LOG.info("generated %d folds (data_start=%s, data_end=%s)",
+             len(folds), data_start, data_end)
+    if first_n is not None:
+        folds = folds[:first_n]
+        LOG.info("first_n=%d → running %d folds", first_n, len(folds))
+
+    out_dir = PROJECT_ROOT / "reports" / "phase_1"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    fold_results: list[dict] = []
+    t0_total = time.perf_counter()
+    for fold in folds:
+        try:
+            res = run_fold(
+                fold=fold, df_full=df_full, bars_close=bars_close,
+                feature_cols=feature_cols, lgbm_params=lgbm_params,
+                purge_bars=wf["purge_bars"], embargo_bars=wf["embargo_bars"],
+                confidence_threshold=confidence_threshold,
+                cost_bps_round_trip=cost_bps_round_trip,
+                out_dir=out_dir, dry_run=dry_run,
+            )
+        except Exception:
+            LOG.exception("fold %d raised; recording skip", fold.fold_id)
+            res = {"fold": fold.fold_id, "skipped": True,
+                   "skip_reason": "exception (see log)"}
+        fold_results.append(res)
+    total_s = time.perf_counter() - t0_total
+
+    # ────── Aggregate ──────
+    evaluated = [r for r in fold_results if not r.get("skipped")]
+    if dry_run or not evaluated:
+        agg = {}
+        pg_summary = {}
+    else:
+        agg = {}
+        for k in ("oot_sharpe", "oot_sortino", "oot_max_dd",
+                 "oot_pct_time_in_market", "oot_n_trades",
+                 "oot_profitable_trade_pct", "oot_annual_return", "ratio"):
+            vals = [r[k] for r in evaluated if k in r]
+            if vals:
+                agg[f"{k}_mean"] = float(np.mean(vals))
+                agg[f"{k}_std"]  = float(np.std(vals, ddof=1)) if len(vals) > 1 else 0.0
+
+        ratios = [r["ratio"] for r in evaluated if "ratio" in r]
+        pg_summary = aggregate_pre_gate(
+            ratios, threshold=pg["threshold"],
+            required_pass=pg["required_pass_folds"], n_first=6,
+        )
+
+    out = {
+        "n_folds_total": len(folds),
+        "n_folds_evaluated": len(evaluated),
+        "n_folds_skipped": len(folds) - len(evaluated),
+        "wall_clock_seconds": total_s,
+        "pre_gate": pg_summary,
+        "aggregate": agg,
+        "per_fold": fold_results,
+    }
+    out_path = out_dir / "lgbm_results.json"
+    out_path.write_text(json.dumps(out, indent=2, default=str))
+    LOG.info("wrote %s", out_path)
+
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────
+def print_sanity_report(out: dict) -> None:
+    print("\n========== Phase 1.0 L0 LightGBM Sanity Report ==========")
+    print(f"Folds total / evaluated / skipped: "
+          f"{out['n_folds_total']} / {out['n_folds_evaluated']} / {out['n_folds_skipped']}")
+    print(f"Wall clock: {out['wall_clock_seconds']:.1f}s")
+
+    pg = out.get("pre_gate") or {}
+    if pg:
+        print(f"\n--- Pre-gate (first 6 folds) ---")
+        print(f"  passed: {pg['n_passed']} / {pg['n_evaluated']}  "
+              f"(required ≥ {pg['required_pass']})  → "
+              f"{'✓ PASSED' if pg.get('passed') else '✗ FAILED'}")
+
+    print(f"\n--- Per-fold metrics ---")
+    print(f"{'fold':>4}  {'val_start':>10}  {'oot_end':>10}  "
+          f"{'n_oot':>5}  {'ratio':>6}  {'PG':>3}  "
+          f"{'sharpe':>7}  {'sortino':>7}  {'max_dd':>7}  "
+          f"{'n_tr':>5}  {'win%':>5}")
+    for r in out["per_fold"]:
+        if r.get("skipped"):
+            print(f"{r['fold']:>4}  SKIPPED ({r.get('skip_reason','')})")
+            continue
+        print(
+            f"{r['fold']:>4}  {r['val_start']:>10}  {r['oot_end']:>10}  "
+            f"{r['n_oot']:>5}  {r['ratio']:>6.4f}  "
+            f"{'✓' if r['pre_gate_pass'] else '✗':>3}  "
+            f"{r['oot_sharpe']:>7.3f}  {r['oot_sortino']:>7.3f}  "
+            f"{r['oot_max_dd']:>7.3f}  {r['oot_n_trades']:>5}  "
+            f"{r['oot_profitable_trade_pct']:>5.1f}"
+        )
+
+    agg = out.get("aggregate") or {}
+    if agg:
+        print(f"\n--- Aggregate (mean ± std across evaluated folds) ---")
+        for k in ("oot_sharpe", "oot_sortino", "oot_max_dd",
+                  "oot_pct_time_in_market", "oot_n_trades",
+                  "oot_profitable_trade_pct", "oot_annual_return", "ratio"):
+            mean = agg.get(f"{k}_mean")
+            std  = agg.get(f"{k}_std")
+            if mean is not None:
+                print(f"  {k:<28} {mean:>9.4f} ± {std:.4f}")
+
+    # Top-10 feature importance from first fold (representative)
+    first_eval = next((r for r in out["per_fold"] if not r.get("skipped")), None)
+    if first_eval and first_eval.get("feature_importance_top10"):
+        print(f"\n--- Top-10 features (gain) — fold {first_eval['fold']} ---")
+        for f in first_eval["feature_importance_top10"]:
+            print(f"  {f['feature']:<22} gain={f['gain']:>14.2f}  split={f['split']:>5}")
+
+    # Per-fold Sharpe variance interpretation note (DR §15 fold)
+    print("\n--- Interpretation ---")
+    print("  Per-fold Sharpe is high-variance for thin OOT (~90 daily returns")
+    print("  per 3-month window). Mean across folds is the meaningful aggregate;")
+    print("  do not over-interpret individual fold swings.")
+
+
+# ─────────────────────────────────────────────────────────────────────
+def main(argv: list[str]) -> int:
+    p = argparse.ArgumentParser(prog="run_phase_1_lgbm")
+    p.add_argument("--first-n", type=int, default=None,
+                   help="Smoke: run only the first N folds.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Build folds + report sample sizes, no training.")
+    args = p.parse_args(argv[1:])
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    try:
+        out = run(first_n=args.first_n, dry_run=args.dry_run)
+        print_sanity_report(out)
+    finally:
+        close_pool()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

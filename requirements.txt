@@ -21,3 +21,7 @@ pyarrow==18.1.0   # Phase 0.3 — parquet write/read for features
 
 # Testing (Phase 0.2+)
 pytest==8.3.4
+
+# Phase 1.0 — L0 LightGBM walk-forward
+lightgbm==4.5.0
+scikit-learn==1.5.2
