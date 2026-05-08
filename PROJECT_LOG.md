@@ -5,6 +5,194 @@
 
 ---
 
+## 2026-05-08 — Decision v3.0.8 — Phase 0.4 triple-barrier labeler contract (DR)
+
+**Context**: Phase 0.4 implements `labels/triple_barrier.py` per spec
+§8.1, reading bars from `events.bars_btc_cusum` and writing a labels
+parquet. The §8.2 frozen parameters (tp_pct=0.05, sl_pct=0.05,
+vertical_bars=24 for BTC) are NOT touched. The §8.4 confidence threshold
+(0.60) is a Phase 1 trainer concern, not a labeler concern.
+
+**Decisions**:
+
+### 1. Output destination + schema
+
+`data/storage/labels/labels_btc.parquet`. Separate from features parquet
+— downstream JOIN on `bar_id` at training time (cleaner layering;
+features and labels evolve independently).
+
+| Column | dtype | nullable | meaning |
+|---|---|---|---|
+| `bar_id` | int64 | no | from bars_btc_cusum |
+| `label` | int8 | no | {0=LONG, 1=SHORT, 2=NEUTRAL, -1=UNLABELABLE} |
+| `exit_bar_id` | Int64 | yes | bar at which barrier hit; null if UNLABELABLE |
+| `exit_reason` | string | yes | {'tp','sl','timeout','ambiguous'}; null if UNLABELABLE |
+| `holding_bars` | Int8 | yes | exit_bar_index − t (1..24); null if UNLABELABLE |
+| `exit_price` | float64 | yes | close at exit; NaN if UNLABELABLE |
+
+`exit_reason='ambiguous'` distinguishes the both-hit-same-bar case
+(label=NEUTRAL by tie-break, see §3) from a clean vertical timeout
+(`exit_reason='timeout'`). Avoids a 5th label class (spec freezes 4
+label values) while preserving diagnostic fidelity.
+
+### 2. Intra-bar barrier detection (HIGH/LOW vs TP/SL)
+
+For each labeled bar `t` with `P_t = bars[t].close`:
+- `TP_price = P_t * (1 + 0.05)`
+- `SL_price = P_t * (1 - 0.05)`
+
+Walk forward `k = t+1 .. t+24` (inclusive both ends; vertical at
+k=t+24 forces NEUTRAL/timeout if no barrier hits earlier):
+- `tp_hit = bars[k].high >= TP_price`  (inclusive)
+- `sl_hit = bars[k].low  <= SL_price`  (inclusive)
+
+The labeled bar `t` itself is NOT checked — labels reflect what
+happens AFTER the signal is observed at close of bar `t`.
+
+### 3. Both-hit-same-bar tie-break — NEUTRAL with exit_reason='ambiguous'
+
+If `tp_hit AND sl_hit` at some bar `k`: `label=NEUTRAL (2)`,
+`exit_reason='ambiguous'`. `exit_bar_id`, `holding_bars`, `exit_price`
+populated normally.
+
+Rationale: with 5% barriers on CUSUM-2% bars, a single bar reaching
+both ±5% from `P_t` is a wide-range whipsaw — most honest is "we can't
+determine direction without sub-bar data". Sanity reports the
+frequency; expected to be rare (<1%) with our ~5h median bar duration.
+
+### 4. UNLABELABLE rule (last 24 bars)
+
+Bar at index `t` is UNLABELABLE iff `t + 24 >= N`. For N=18,629:
+indices 18,605..18,628 (24 bars) → label=-1, all diagnostic fields null.
+Labelable count = 18,605.
+
+### 5. Reproducibility — md5 fingerprint
+
+Same pattern as DR v3.0.6 / v3.0.7. md5 over canonicalized labels
+parquet (sorted by bar_id, all columns text-serialized). Re-runs
+identical given identical bars source.
+
+### 6. Class balance reporting + hard-fail bounds
+
+Sanity report prints class percentages (UNLABELABLE excluded from
+denominator — structural property, not a model class).
+
+Three-tier check:
+- **Clean**: each class within §8.3 expected range (35-40 LONG/SHORT,
+  20-30 NEUTRAL) → green
+- **Warn**: any class outside §8.3 but within 10–50% → print warning,
+  proceed
+- **Hard-fail**: any class > 50% OR any class < 10% →
+  `AssertionError` with message including "see spec §8.3 for expected
+  class balance ranges; investigate label-config (TP/SL vs CUSUM
+  threshold) before proceeding to Phase 1." (per user 2026-05-08 fold:
+  message references §8.3 explicitly so future debuggers land at the
+  right spec section). Parquet is still written (for inspection) but
+  the build exits non-zero so a CI/shell pipeline catches imbalance
+  before Phase 1 reads stale labels.
+
+In smoke mode (`--month YYYY-MM`), class-balance assertions are
+relaxed to warnings (not hard-fail). The hard-fail is meaningful only
+for the full sweep where statistics across the entire 7.4-yr window
+are stable.
+
+### 7. Iteration pattern — naive O(N × vertical_bars) Python loop
+
+18,629 × 24 ≈ 447k iterations is ~1s in Python. No vectorization.
+
+### 8. Frozen-parameter runtime check
+
+At entry to `run_label()`, assert:
+```python
+assert cfg["labeling"]["tp_pct"]["BTC"] == 0.05
+assert cfg["labeling"]["sl_pct"]["BTC"] == 0.05
+assert cfg["labeling"]["vertical_bars"] == 24
+```
+
+Discipline guard — any drift from §10.1 frozen values requires a DR
+explicitly changing them.
+
+### 9. Reference price + comparison semantics
+
+`P_t = bars[t].close`. Forward checks start at `t+1`. Comparisons
+inclusive (`>=`, `<=`).
+
+### 10. Source — bars table, not features parquet
+
+Reads `events.bars_btc_cusum` directly (`bar_id, close, high, low`
+ordered by `bar_close_ts, bar_id`). Features parquet has no OHLC.
+Labels parquet keyed by `bar_id` for downstream JOIN with features.
+
+### 11. CLI surface
+
+```
+python -m labels.triple_barrier                  # full build
+python -m labels.triple_barrier --dry-run        # in-memory + sanity, no parquet
+python -m labels.triple_barrier --month YYYY-MM  # smoke (single month)
+```
+
+### 12. Sanity report (post-build)
+
+- Row count == bar count
+- Schema check (6 columns in DR §1 order)
+- Class distribution (LONG/SHORT/NEUTRAL/UNLABELABLE) — UNLABELABLE
+  separate; not in % denominator
+- exit_reason distribution: tp / sl / timeout / ambiguous / null
+- holding_bars histogram (1..24 + null)
+- §8.3 expected-range check (35-40/35-40/20-30)
+- §6 hard-fail thresholds (>50% any / <10% any) — full sweep only
+- **Path-dependence diagnostic** (per user 2026-05-08 fold):
+  - count of LONG-labeled bars where SL was also touched in
+    `[exit_bar_id+1 .. t+24]`, as % of all LONG labels
+  - mirror for SHORT (TP touched after SL exit)
+  - threshold guidance (informational, no enforcement):
+    `<10%` clean (first-touch reflects sustained move),
+    `>40%` noisy (many "wins" would have whipsawed back). If high,
+    Phase 0.5 DR could revisit with López de Prado-style double-touch
+    labels.
+- md5 fingerprint
+
+### 13. Test fixtures
+
+Synthetic-bars set:
+- TP-then-SL within window (TP wins) → LONG
+- SL-then-TP within window (SL wins) → SHORT
+- Neither hit → NEUTRAL (timeout)
+- Whipsaw same bar (both hit) → NEUTRAL (ambiguous)
+- Last 24 bars → UNLABELABLE
+- Determinism (run twice → identical)
+
+Plus 4 boundary tests (per user 2026-05-08 fold):
+- **TP at exactly t+1** → LONG, holding_bars=1, exit_reason='tp' (catches
+  off-by-one in walk-forward start)
+- **TP at exactly t+24** → LONG, holding_bars=24, exit_reason='tp'
+  (catches the vertical-vs-tp boundary semantic — 'tp' NOT 'timeout')
+- **TP miss through t+24, no SL** → NEUTRAL, holding_bars=24,
+  exit_reason='timeout' (corollary of above; both must work)
+- **SL at exactly t+24, no TP** → SHORT, holding_bars=24,
+  exit_reason='sl' (mirror of t+24 TP test)
+
+Plus 30-bar golden: hand-computed labels for an engineered price path.
+
+### Implementation surface (informational)
+
+- `labels/triple_barrier.py`: `apply_triple_barrier(bars_df, tp_pct,
+  sl_pct, vertical_bars)` returns labels DataFrame; `_path_dependence_check()`
+  computes the §12 path-dep diagnostic; `run_label()` orchestrates;
+  CLI.
+- `labels/tests/test_triple_barrier.py`: original synthetic set + 4
+  boundary tests + 30-bar golden.
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-08; three
+folds: §6 message references spec §8.3, §13 adds 4 boundary tests,
+§12 adds path-dependence diagnostic.
+
+**References**: Spec §8.1, §8.2, §8.3, §8.4, §10.1; config.yaml:73-83;
+DR v3.0.5 (bars source schema), DR v3.0.6 (sub-µs ordering),
+DR v3.0.7 (parquet pattern); López de Prado 2018 Ch. 3.
+
+---
+
 ## 2026-05-07 — Decision v3.0.7 — Phase 0.3 feature builder contract (DR)
 
 **Context**: Phase 0.3 implements `features/builder.py` per spec §7.1
