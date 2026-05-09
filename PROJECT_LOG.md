@@ -5,6 +5,87 @@
 
 ---
 
+## 2026-05-09 — Decision v3.0.12 — Joint TB=0.03 × threshold sweep (DR)
+
+**Context**: DR v3.0.11 TB sweep result (commit `08edee0`,
+tag `v3.0.11-phase1-baseline`):
+
+- TB=0.03 emerged as substantially best operating point at default 0.60
+  confidence threshold: 351 trades (3.8× default), Sharpe(nonzero)
+  +0.564, mean +48 bps net, both LONG and SHORT working
+- Still below 1.0 Phase A gate (§16.1)
+- DR v3.0.10 threshold sweep was done on TB=0.05 default labels — the
+  optimal threshold for TB=0.03's *different* label distribution and
+  *different* calibrated probability distribution is unmeasured
+
+The 0.60 threshold inherited from spec §8.4 + Lessmann is anchored to
+his label distribution. Our TB=0.03 produces a different prior
+(more LONG/SHORT, less NEUTRAL → calibrated probs land in different
+band) — the joint optimum may be at a different threshold.
+
+This is the **last cheap close** before days-long commitments. After
+this DR lands we go to either §16.4 step (2) features (Tier 1 plan
+already discussed) or one of the strategic forks (3a ETH, 3b
+signal-provider).
+
+**Decision**: TB=0.03 held constant; sweep threshold across
+**{0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65}** (7 values; brackets the
+DR v3.0.10 threshold sweep range). In-memory relabel once at TB=0.03
+(reusing DR v3.0.11 mechanics), then training shared per fold (one
+LightGBM + Platt fit per fold), backtest re-runs per threshold. Same
+purge/embargo, same model, same Platt — only post-prediction trade
+rule varies.
+
+### Mechanics
+
+1. Relabel bars with `apply_triple_barrier(bars, tp=0.03, sl=0.03, vertical=24)` — in-memory, once
+2. Merge with features parquet on `bar_id`, drop UNLABELABLE
+3. Generate 20 folds (18 evaluated; 2 skipped on n<100 guard)
+4. Per fold: train + Platt fit (once), then for each of 7 thresholds:
+   simulate_trades + metrics
+5. Aggregate per-threshold across all folds
+
+Wall time: ~3–5 min (training once per fold = ~3 min; backtest per
+threshold is fast).
+
+### Output
+
+`reports/phase_1/joint_tb03_threshold_sweep.json`. Schema mirrors
+`threshold_sweep.json` (DR v3.0.10) for direct apples-to-apples
+comparison; only the underlying labels differ (TB=0.03 vs TB=0.05).
+
+### CLI
+
+```
+python -m scripts.run_phase_1_lgbm --joint-sweep
+```
+
+### Why safe
+
+- Default tp/sl=0.05 and threshold=0.60 in `config.yaml` unchanged
+- §10.1 freeze unchanged; production change requires separate DR
+- Sensitivity analysis to characterize joint TB×threshold curve, not
+  pick a winner
+- Same discipline as DR v3.0.10 / v3.0.11 (don't optimize on test;
+  characterize)
+
+### Decision tree on result
+
+| Outcome at any threshold under TB=0.03 | Action |
+|---|---|
+| Sharpe ≥ 0.8 (surprise) | TB=0.03 + best-threshold close enough to gate that L1 ResNet-LSTM (3 days) might bridge — real conversation, possible L1 GO |
+| Sharpe peaks 0.5–0.7 (most-likely outcome) | BTC ceiling confirmed at 4 independent operating points. Strategic fork: 3a (ETH) vs 3b (signal-provider) vs Tier 1 features (modest probabilistic upside). Real conversation. |
+| Sharpe regresses below 0.4 anywhere | TB=0.03 finding doesn't generalize; revert to TB=0.05 / threshold=0.58 baseline; ship 3b directly |
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-09 in
+strategic-checkpoint message; mechanics + thresholds + output schema
+specified by user; cheap-close-first discipline preserved.
+
+**References**: DR v3.0.10 (threshold sweep methodology), DR v3.0.11
+(TB sweep result), spec §16.4 fallback ladder, §10.1 frozen Phase A.
+
+---
+
 ## 2026-05-08 — Decision v3.0.11 — TB sweep (§16.4 step 1) (DR)
 
 **Context**: After commit `2c71b43` (DR v3.0.10 threshold sweep) the
