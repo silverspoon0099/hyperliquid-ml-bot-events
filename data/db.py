@@ -3,10 +3,10 @@
 Shared DB instance with v1.0 (Decision v2.27); credentials symlinked from
 v1.0's .env per DR v3.0.2 §5. Schema "events" per spec §6.1.
 
-Conventions mirror /nvme1/projects/trading/ml-bot/data/db.py:
-  * Connection pool with row_factory=dict_row
-  * SQLAlchemy engine alongside for pandas.read_sql_query
-  * load_dotenv at module import (absolute path to repo root)
+DR v3.0.14: schema bootstrap parameterized by symbol. Tables follow
+`events.ticks_{sym}` / `events.bars_{sym}_cusum` convention. Default
+init_schema() still creates BTC tables for backward compatibility.
+Phase B (SOL/LINK) and Path 3a (ETH) use init_schema(symbols=["ETH"]) etc.
 
 Phase 0.1 surface: init_schema(), get_connection(), ping(), close_pool().
 """
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Optional
 
 import psycopg
 from psycopg import Connection
@@ -77,31 +78,28 @@ def close_pool() -> None:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Schema bootstrap — DR v3.0.2 §1, §1b, §2
+# Symbol → table-name helpers (DR v3.0.14)
+# ─────────────────────────────────────────────────────────────────────────
+def symbol_short(symbol: str) -> str:
+    """Map Binance ticker (BTCUSDT/ETHUSDT) or bare symbol (BTC/ETH) → 'btc'/'eth'."""
+    s = symbol.upper()
+    if s.endswith("USDT"):
+        s = s[:-4]
+    return s.lower()
+
+
+def ticks_table(symbol: str) -> str:
+    return f"events.ticks_{symbol_short(symbol)}"
+
+
+def bars_table(symbol: str) -> str:
+    return f"events.bars_{symbol_short(symbol)}_cusum"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Schema bootstrap — DR v3.0.2 §1, §1b, §2; DR v3.0.5 §8; DR v3.0.14
 # ─────────────────────────────────────────────────────────────────────────
 _DDL_SCHEMA = "CREATE SCHEMA IF NOT EXISTS events;"
-
-_DDL_TICKS_BTC = """
-CREATE TABLE IF NOT EXISTS events.ticks_btc (
-    agg_id          BIGINT           NOT NULL,
-    ts              TIMESTAMPTZ      NOT NULL,
-    price           DOUBLE PRECISION NOT NULL,
-    qty             DOUBLE PRECISION NOT NULL,
-    quote_qty       DOUBLE PRECISION NOT NULL,
-    is_buyer_maker  BOOLEAN          NOT NULL,
-    first_trade_id  BIGINT           NOT NULL,
-    last_trade_id   BIGINT           NOT NULL,
-    PRIMARY KEY (agg_id, ts)
-);
-"""
-
-_DDL_HYPERTABLE = """
-SELECT create_hypertable(
-    'events.ticks_btc', 'ts',
-    chunk_time_interval => %s::interval,
-    if_not_exists => TRUE
-);
-"""
 
 _DDL_INGEST_LOG = """
 CREATE TABLE IF NOT EXISTS events.ingest_log (
@@ -115,82 +113,109 @@ CREATE TABLE IF NOT EXISTS events.ingest_log (
 );
 """
 
-_CHECK_COMPRESSION_ENABLED = """
-SELECT 1
-FROM timescaledb_information.compression_settings
-WHERE hypertable_schema = 'events' AND hypertable_name = 'ticks_btc'
-LIMIT 1;
-"""
 
-_DDL_ENABLE_COMPRESSION = """
-ALTER TABLE events.ticks_btc SET (
-    timescaledb.compress,
-    timescaledb.compress_segmentby = 'is_buyer_maker',
-    timescaledb.compress_orderby   = 'ts, agg_id'
-);
-"""
+def _ddl_ticks(symbol: str) -> str:
+    table = ticks_table(symbol)
+    return f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            agg_id          BIGINT           NOT NULL,
+            ts              TIMESTAMPTZ      NOT NULL,
+            price           DOUBLE PRECISION NOT NULL,
+            qty             DOUBLE PRECISION NOT NULL,
+            quote_qty       DOUBLE PRECISION NOT NULL,
+            is_buyer_maker  BOOLEAN          NOT NULL,
+            first_trade_id  BIGINT           NOT NULL,
+            last_trade_id   BIGINT           NOT NULL,
+            PRIMARY KEY (agg_id, ts)
+        );
+    """
 
-_DDL_COMPRESSION_POLICY = """
-SELECT add_compression_policy(
-    'events.ticks_btc', %s::interval,
-    if_not_exists => TRUE
-);
-"""
 
-# DR v3.0.5 §8: bars table + hypertable. PK is (bar_id, bar_close_ts) — Timescale
-# requires the partitioning column in every uniqueness constraint, same pattern
-# as events.ticks_btc PK (agg_id, ts). UNIQUE(bar_close_ts, threshold_pct) per §6.3.
-_DDL_BARS_BTC_CUSUM = """
-CREATE TABLE IF NOT EXISTS events.bars_btc_cusum (
-    bar_id        BIGSERIAL,
-    bar_open_ts   TIMESTAMPTZ      NOT NULL,
-    bar_close_ts  TIMESTAMPTZ      NOT NULL,
-    open          DOUBLE PRECISION NOT NULL,
-    high          DOUBLE PRECISION NOT NULL,
-    low           DOUBLE PRECISION NOT NULL,
-    close         DOUBLE PRECISION NOT NULL,
-    volume        DOUBLE PRECISION NOT NULL,
-    n_trades      INTEGER          NOT NULL,
-    cusum_pos     DOUBLE PRECISION,
-    cusum_neg     DOUBLE PRECISION,
-    threshold_pct DOUBLE PRECISION NOT NULL,
-    PRIMARY KEY (bar_id, bar_close_ts)
-);
-"""
+def _ddl_bars(symbol: str) -> str:
+    table = bars_table(symbol)
+    return f"""
+        CREATE TABLE IF NOT EXISTS {table} (
+            bar_id        BIGSERIAL,
+            bar_open_ts   TIMESTAMPTZ      NOT NULL,
+            bar_close_ts  TIMESTAMPTZ      NOT NULL,
+            open          DOUBLE PRECISION NOT NULL,
+            high          DOUBLE PRECISION NOT NULL,
+            low           DOUBLE PRECISION NOT NULL,
+            close         DOUBLE PRECISION NOT NULL,
+            volume        DOUBLE PRECISION NOT NULL,
+            n_trades      INTEGER          NOT NULL,
+            cusum_pos     DOUBLE PRECISION,
+            cusum_neg     DOUBLE PRECISION,
+            threshold_pct DOUBLE PRECISION NOT NULL,
+            PRIMARY KEY (bar_id, bar_close_ts)
+        );
+    """
 
-_DDL_BARS_HYPERTABLE = """
-SELECT create_hypertable(
-    'events.bars_btc_cusum', 'bar_close_ts',
-    chunk_time_interval => %s::interval,
-    if_not_exists => TRUE
-);
-"""
+
+def _init_symbol_tables(
+    cur, symbol: str,
+    chunk_interval_ticks: str, compress_after_ticks: str,
+    chunk_interval_bars: str,
+) -> None:
+    """Create ticks_{sym} + bars_{sym}_cusum tables, hypertables, compression policy."""
+    sym = symbol_short(symbol)
+    t_ticks = ticks_table(symbol)
+    t_bars = bars_table(symbol)
+
+    cur.execute(_ddl_ticks(symbol))
+    cur.execute(
+        f"SELECT create_hypertable(%s, 'ts', "
+        f"chunk_time_interval => %s::interval, if_not_exists => TRUE);",
+        (t_ticks, chunk_interval_ticks),
+    )
+
+    cur.execute(
+        "SELECT 1 FROM timescaledb_information.compression_settings "
+        "WHERE hypertable_schema='events' AND hypertable_name=%s LIMIT 1",
+        (f"ticks_{sym}",),
+    )
+    if cur.fetchone() is None:
+        cur.execute(
+            f"ALTER TABLE {t_ticks} SET ("
+            f"timescaledb.compress, "
+            f"timescaledb.compress_segmentby = 'is_buyer_maker', "
+            f"timescaledb.compress_orderby = 'ts, agg_id');"
+        )
+    cur.execute(
+        f"SELECT add_compression_policy(%s, %s::interval, if_not_exists => TRUE);",
+        (t_ticks, compress_after_ticks),
+    )
+
+    cur.execute(_ddl_bars(symbol))
+    cur.execute(
+        f"SELECT create_hypertable(%s, 'bar_close_ts', "
+        f"chunk_time_interval => %s::interval, if_not_exists => TRUE);",
+        (t_bars, chunk_interval_bars),
+    )
 
 
 def init_schema(
     chunk_interval_ticks: str = "7 days",
     compress_after_ticks: str = "30 days",
     chunk_interval_bars: str = "180 days",
+    symbols: Optional[list[str]] = None,
 ) -> None:
-    """Create schema + tables + hypertables + compression policy. Idempotent.
+    """Create schema + per-symbol tables + hypertables + compression. Idempotent.
 
-    Defaults match config.yaml (DR v3.0.2 §2 for ticks; DR v3.0.5 §8 for bars).
-    Pass overrides only for tests.
+    Defaults match config.yaml. `symbols` defaults to ['BTC'] for backward
+    compatibility; pass ['ETH'] or ['BTC','ETH'] for multi-asset (DR v3.0.14).
     """
+    if symbols is None:
+        symbols = ["BTC"]
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(_DDL_SCHEMA)
-            cur.execute(_DDL_TICKS_BTC)
-            cur.execute(_DDL_HYPERTABLE, (chunk_interval_ticks,))
             cur.execute(_DDL_INGEST_LOG)
-
-            cur.execute(_CHECK_COMPRESSION_ENABLED)
-            if cur.fetchone() is None:
-                cur.execute(_DDL_ENABLE_COMPRESSION)
-            cur.execute(_DDL_COMPRESSION_POLICY, (compress_after_ticks,))
-
-            cur.execute(_DDL_BARS_BTC_CUSUM)
-            cur.execute(_DDL_BARS_HYPERTABLE, (chunk_interval_bars,))
+            for sym in symbols:
+                _init_symbol_tables(
+                    cur, sym, chunk_interval_ticks,
+                    compress_after_ticks, chunk_interval_bars,
+                )
         conn.commit()
 
 
@@ -218,6 +243,7 @@ def ping() -> dict:
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "init":
-        init_schema()
-        print("Schema initialized.")
+        symbols = sys.argv[2:] if len(sys.argv) > 2 else ["BTC"]
+        init_schema(symbols=symbols)
+        print(f"Schema initialized for: {symbols}")
     print(ping())

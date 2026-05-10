@@ -258,7 +258,12 @@ def build_features(bars_df: pd.DataFrame) -> pd.DataFrame:
 # ─────────────────────────────────────────────────────────────────────
 # DB load + parquet write
 # ─────────────────────────────────────────────────────────────────────
-def _load_bars(threshold: float, month_filter: Optional[date] = None) -> pd.DataFrame:
+def _load_bars(
+    threshold: float, month_filter: Optional[date] = None,
+    symbol: str = "BTC",
+) -> pd.DataFrame:
+    """Load bars from events.bars_{sym}_cusum (DR v3.0.14 multi-asset)."""
+    from data.db import bars_table
     where = "WHERE threshold_pct = %(t)s"
     params: dict = {"t": threshold}
     if month_filter is not None:
@@ -274,7 +279,7 @@ def _load_bars(threshold: float, month_filter: Optional[date] = None) -> pd.Data
         SELECT bar_id, bar_open_ts, bar_close_ts,
                open, high, low, close, volume, n_trades,
                cusum_pos, cusum_neg
-        FROM events.bars_btc_cusum
+        FROM {bars_table(symbol)}
         {where}
         ORDER BY bar_close_ts, bar_id
     """
@@ -387,15 +392,20 @@ def run_build(
     threshold: float,
     month_filter: Optional[date] = None,
     dry_run: bool = False,
+    symbol: str = "BTC",
 ) -> dict:
+    """Build features for one symbol; writes features_{sym}.parquet (DR v3.0.14)."""
+    from data.db import symbol_short
+    sym = symbol_short(symbol)
     cfg = load_config()
     output_dir = PROJECT_ROOT / cfg["features"]["output_dir"]
-    output_path = output_dir / "features_btc.parquet"
+    output_path = output_dir / f"features_{sym}.parquet"
 
-    LOG.info("loading bars: threshold=%s month=%s", threshold,
+    LOG.info("loading bars: symbol=%s threshold=%s month=%s",
+             symbol, threshold,
              f"{month_filter:%Y-%m}" if month_filter else "<all>")
     t0 = time.perf_counter()
-    bars = _load_bars(threshold, month_filter)
+    bars = _load_bars(threshold, month_filter, symbol=symbol)
     load_s = time.perf_counter() - t0
     LOG.info("loaded %d bars in %.1fs", len(bars), load_s)
 
@@ -434,6 +444,8 @@ def main(argv: list[str]) -> int:
                    help="Limit to one calendar month (smoke / debug).")
     p.add_argument("--dry-run", action="store_true",
                    help="Build in memory + report; do not write parquet.")
+    p.add_argument("--symbol", default="BTC",
+                   help="DR v3.0.14: asset symbol (BTC|ETH). Default BTC.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -441,8 +453,11 @@ def main(argv: list[str]) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    from data.db import symbol_short
+    sym = symbol_short(args.symbol).upper()
+
     cfg = load_config()
-    threshold = cfg["bars"]["threshold"]["BTC"]
+    threshold = cfg["bars"]["threshold"].get(sym, cfg["bars"]["threshold"]["BTC"])
 
     month_filter: Optional[date] = None
     if args.month:
@@ -450,7 +465,7 @@ def main(argv: list[str]) -> int:
 
     try:
         run_build(threshold=threshold, month_filter=month_filter,
-                  dry_run=args.dry_run)
+                  dry_run=args.dry_run, symbol=sym)
     finally:
         close_pool()
     return 0

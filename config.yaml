@@ -34,7 +34,7 @@ universe:
 data:
   binance:
     archive_host: "https://data.binance.vision/data/spot/monthly/aggTrades"
-    symbols:      [BTCUSDT]
+    symbols:      [BTCUSDT, ETHUSDT]   # DR v3.0.14: ETHUSDT added for Path 3a
     start_date:   "2019-01-01"
     storage_dir:  data/storage/binance_ticks
   hyperliquid:
@@ -49,8 +49,9 @@ data:
 # ────────────────────────────────────────────────────────────────────
 bars:
   type: cusum
-  threshold:           # FROZEN per spec §10.1
+  threshold:           # FROZEN per spec §10.1 for BTC; ETH inherits same per Lessmann
     BTC: 0.02          # Lessmann anchor
+    ETH: 0.02          # DR v3.0.14: Path 3a transfer test, same anchor
   max_bar_duration_hours: 168  # 7-day fail-safe; force close if no movement
 
 # ────────────────────────────────────────────────────────────────────
@@ -74,10 +75,12 @@ features:
 # ────────────────────────────────────────────────────────────────────
 labeling:
   method: triple_barrier
-  tp_pct:                       # FROZEN per spec §10.1
+  tp_pct:                       # FROZEN per spec §10.1 for BTC; ETH same per DR v3.0.14
     BTC: 0.05
+    ETH: 0.05
   sl_pct:
     BTC: 0.05
+    ETH: 0.05
   vertical_bars: 24             # FROZEN per spec §10.1
   classes:
     LONG:    0

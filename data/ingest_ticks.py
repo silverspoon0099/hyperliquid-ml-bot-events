@@ -39,7 +39,7 @@ from typing import Iterable, Iterator
 import requests
 import yaml
 
-from .db import close_pool, get_connection, init_schema
+from .db import close_pool, get_connection, init_schema, symbol_short
 
 LOG = logging.getLogger("ingest_ticks")
 
@@ -238,8 +238,11 @@ _COPY_STAGING_SQL = (
     "FROM STDIN WITH (FORMAT BINARY)"
 )
 
-_INSERT_FROM_STAGING = """
-INSERT INTO events.ticks_btc
+# DR v3.0.14: symbol-parameterized INSERT (target table per symbol).
+def _insert_from_staging_sql(symbol: str) -> str:
+    from data.db import ticks_table
+    return f"""
+INSERT INTO {ticks_table(symbol)}
     (agg_id, ts, price, qty, quote_qty, is_buyer_maker,
      first_trade_id, last_trade_id)
 SELECT agg_id, ts, price, qty, quote_qty, is_buyer_maker,
@@ -247,6 +250,8 @@ SELECT agg_id, ts, price, qty, quote_qty, is_buyer_maker,
 FROM _staging_ticks
 ON CONFLICT (agg_id, ts) DO NOTHING;
 """
+
+
 _COPY_TYPES = ["bigint", "timestamptz", "float8", "float8", "float8",
                "bool", "bigint", "bigint"]
 
@@ -262,9 +267,10 @@ ON CONFLICT (symbol, month) DO UPDATE SET
 """
 
 
-def _existing_count(cur, month: date) -> int:
+def _existing_count(cur, symbol: str, month: date) -> int:
+    from data.db import ticks_table
     cur.execute(
-        "SELECT COUNT(*) AS n FROM events.ticks_btc WHERE ts >= %s AND ts < %s",
+        f"SELECT COUNT(*) AS n FROM {ticks_table(symbol)} WHERE ts >= %s AND ts < %s",
         (month, _next_month(month)),
     )
     return cur.fetchone()["n"]
@@ -292,10 +298,12 @@ def _ingest_month_atomic(
     Returns post-dedup row count (may be < expected_rows if the source
     CSV contained Binance publishing duplicates).
     """
+    from data.db import ticks_table
+    target_table = ticks_table(symbol)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM events.ticks_btc WHERE ts >= %s AND ts < %s",
+                f"DELETE FROM {target_table} WHERE ts >= %s AND ts < %s",
                 (month, _next_month(month)),
             )
             cur.execute(_CREATE_STAGING)
@@ -306,7 +314,7 @@ def _ingest_month_atomic(
                         t.agg_id, t.ts, t.price, t.qty, t.quote_qty,
                         t.is_buyer_maker, t.first_trade_id, t.last_trade_id,
                     ))
-            cur.execute(_INSERT_FROM_STAGING)
+            cur.execute(_insert_from_staging_sql(symbol))
             actual = cur.rowcount
             cur.execute(_LOG_UPSERT, (symbol, month, sha256, expected_rows, actual))
         conn.commit()
@@ -351,7 +359,7 @@ def ingest_one_month(symbol: str, month: date, storage_dir: Path) -> dict:
     # 4-7. skip / re-ingest decision
     with get_connection() as conn:
         with conn.cursor() as cur:
-            existing = _existing_count(cur, month)
+            existing = _existing_count(cur, symbol, month)
             logged = _logged_sha(cur, symbol, month)
 
     base = {
@@ -392,39 +400,41 @@ def ingest_one_month(symbol: str, month: date, storage_dir: Path) -> dict:
 # ─────────────────────────────────────────────────────────────────────────
 # Sanity checks (DR §4 + Appendix A)
 # ─────────────────────────────────────────────────────────────────────────
-def sanity_checks() -> dict:
-    """Returns a report dict; raises on hard failures."""
-    out: dict = {}
+def sanity_checks(symbol: str = "BTC") -> dict:
+    """Returns a report dict; raises on hard failures. DR v3.0.14: symbol-aware."""
+    from data.db import ticks_table
+    t = ticks_table(symbol)
+    out: dict = {"symbol": symbol}
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT COUNT(*) AS n, MIN(ts) AS first_ts, MAX(ts) AS last_ts
-                FROM events.ticks_btc
+                FROM {t}
             """)
             r = cur.fetchone()
             out["total_ticks"] = r["n"]
             out["first_ts"] = r["first_ts"]
             out["last_ts"] = r["last_ts"]
 
-            cur.execute("""
+            cur.execute(f"""
                 SELECT date_trunc('month', ts) AS m, COUNT(*) AS n
-                FROM events.ticks_btc
+                FROM {t}
                 GROUP BY 1 ORDER BY 1
             """)
             out["ticks_per_month"] = [(r["m"], r["n"]) for r in cur.fetchall()]
 
-            cur.execute("""
+            cur.execute(f"""
                 SELECT date_trunc('day', ts) AS d, SUM(quote_qty) AS quote_vol
-                FROM events.ticks_btc
+                FROM {t}
                 GROUP BY 1 ORDER BY 1
             """)
             out["daily_quote_volume"] = [(r["d"], r["quote_vol"]) for r in cur.fetchall()]
 
             # DR §4: minute-aggregated zero-activity gaps > 1 hr
-            cur.execute("""
+            cur.execute(f"""
                 WITH minute_bins AS (
                     SELECT date_trunc('minute', ts) AS m
-                    FROM events.ticks_btc
+                    FROM {t}
                     GROUP BY 1
                 ),
                 gaps AS (
@@ -437,10 +447,10 @@ def sanity_checks() -> dict:
             out["activity_gaps_gt_1h"] = [(r["m"], r["gap"]) for r in cur.fetchall()]
 
             # agg_id monotonicity per month
-            cur.execute("""
+            cur.execute(f"""
                 SELECT date_trunc('month', ts) AS m,
                        MIN(agg_id) AS min_id, MAX(agg_id) AS max_id, COUNT(*) AS n
-                FROM events.ticks_btc
+                FROM {t}
                 GROUP BY 1 ORDER BY 1
             """)
             out["agg_id_per_month"] = [
@@ -448,10 +458,10 @@ def sanity_checks() -> dict:
             ]
 
             # (d) agg_id global span vs count
-            cur.execute("""
+            cur.execute(f"""
                 SELECT MIN(agg_id) AS mn, MAX(agg_id) AS mx, COUNT(*) AS n,
                        MAX(agg_id) - MIN(agg_id) + 1 AS span
-                FROM events.ticks_btc
+                FROM {t}
             """)
             out["agg_id_global"] = dict(cur.fetchone())
 
@@ -561,31 +571,53 @@ def print_sanity_report(rep: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────
 # Entry point
 # ─────────────────────────────────────────────────────────────────────────
-def _print_checkpoint(after_month: str, cum_rows: int, cum_t: float) -> None:
+def _print_checkpoint(symbol: str, after_month: str, cum_rows: int,
+                       cum_t: float) -> None:
+    from data.db import ticks_table, symbol_short
+    t = ticks_table(symbol)
+    sym = symbol_short(symbol)
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT COUNT(*) AS n FROM timescaledb_information.chunks
-                WHERE hypertable_schema='events' AND hypertable_name='ticks_btc'
-            """)
+                WHERE hypertable_schema='events' AND hypertable_name=%s
+            """, (f"ticks_{sym}",))
             chunks = cur.fetchone()["n"]
-            cur.execute(
-                "SELECT pg_size_pretty(hypertable_size('events.ticks_btc')) AS sz"
-            )
+            cur.execute(f"SELECT pg_size_pretty(hypertable_size('{t}')) AS sz")
             size = cur.fetchone()["sz"]
     print(
-        f"=== checkpoint after {after_month}: rows={cum_rows:,}  "
+        f"=== [{symbol}] checkpoint after {after_month}: rows={cum_rows:,}  "
         f"time={cum_t:.0f}s  chunks={chunks}  size={size} ===",
         flush=True,
     )
 
 
-def run_ingest() -> None:
+def run_ingest(symbol_filter: Optional[str] = None) -> None:
+    """Run ingest for all configured symbols, or just one if symbol_filter given.
+
+    DR v3.0.14: when symbol_filter is set, init_schema only the target symbol
+    and ingest only its months from the config's symbols list.
+    """
     cfg = load_config()
+    config_symbols = cfg["data"]["binance"]["symbols"]
+    if symbol_filter is not None:
+        if symbol_filter not in config_symbols:
+            raise ValueError(
+                f"symbol {symbol_filter!r} not in config symbols list "
+                f"{config_symbols}; add it to config.yaml first"
+            )
+        symbols_to_run = [symbol_filter]
+    else:
+        symbols_to_run = config_symbols
+
+    # Map BTCUSDT → BTC for schema bootstrap
+    from data.db import symbol_short
+    schema_symbols = list({symbol_short(s).upper() for s in symbols_to_run})
     init_schema(
         chunk_interval_ticks=cfg["database"]["chunk_interval_ticks"],
         compress_after_ticks=cfg["database"]["compress_after_ticks"],
         chunk_interval_bars=cfg["database"]["chunk_interval_bars"],
+        symbols=schema_symbols,
     )
 
     binance_cfg = cfg["data"]["binance"]
@@ -606,15 +638,15 @@ def run_ingest() -> None:
 
     work = [
         (symbol, month)
-        for symbol in binance_cfg["symbols"]
+        for symbol in symbols_to_run
         for month in all_months
         if (symbol, month) not in done
     ]
     N = len(work)
-    total = len(all_months) * len(binance_cfg["symbols"])
+    total = len(all_months) * len(symbols_to_run)
     print(
         f"Phase 0.1 ingest: {N} pending of {total} total "
-        f"({len(done)} already in ingest_log)",
+        f"({len(done)} already in ingest_log; symbols={symbols_to_run})",
         flush=True,
     )
 
@@ -627,7 +659,7 @@ def run_ingest() -> None:
         cum_rows += res["actual"]
         cum_t += total_s
         print(
-            f"[{i:>2}/{N}] {res['month']}  "
+            f"[{i:>2}/{N}] {symbol} {res['month']}  "
             f"download={res['download_s']:5.1f}s  sha=ok  "
             f"rows={res['actual']:>10,}  "
             f"copy={res['copy_s']:5.1f}s  "
@@ -635,10 +667,13 @@ def run_ingest() -> None:
             flush=True,
         )
         if i % 12 == 0 or i == N:
-            _print_checkpoint(res["month"], cum_rows, cum_t)
+            _print_checkpoint(symbol, res["month"], cum_rows, cum_t)
     # No try/except: STEP 3 contract — fail fast, do not skip and continue.
 
-    print_sanity_report(sanity_checks())
+    # Per-symbol sanity report
+    for sym_ticker in symbols_to_run:
+        sym = symbol_short(sym_ticker).upper()
+        print_sanity_report(sanity_checks(symbol=sym))
 
 
 def _run_single_month(month_str: str) -> int:
@@ -677,6 +712,10 @@ def main(argv: list[str]) -> int:
                    help="Smoke-test: ingest a single month and exit.")
     p.add_argument("--sanity", action="store_true",
                    help="Run sanity checks only (no ingest).")
+    p.add_argument("--symbol", metavar="SYMBOL",
+                   help="DR v3.0.14: restrict to one symbol (e.g. BTCUSDT, "
+                        "ETHUSDT). Must be in config.yaml symbols list. "
+                        "If omitted, processes all configured symbols.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -686,11 +725,12 @@ def main(argv: list[str]) -> int:
 
     try:
         if args.sanity:
-            print_sanity_report(sanity_checks())
+            sym_arg = symbol_short(args.symbol).upper() if args.symbol else "BTC"
+            print_sanity_report(sanity_checks(symbol=sym_arg))
             return 0
         if args.month:
             return _run_single_month(args.month)
-        run_ingest()
+        run_ingest(symbol_filter=args.symbol)
         return 0
     finally:
         close_pool()

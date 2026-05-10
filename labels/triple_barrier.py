@@ -201,7 +201,12 @@ def _path_dependence_check(
 # ─────────────────────────────────────────────────────────────────────
 # DB load + parquet write
 # ─────────────────────────────────────────────────────────────────────
-def _load_bars(threshold: float, month_filter: Optional[date] = None) -> pd.DataFrame:
+def _load_bars(
+    threshold: float, month_filter: Optional[date] = None,
+    symbol: str = "BTC",
+) -> pd.DataFrame:
+    """Load bars from events.bars_{sym}_cusum (DR v3.0.14)."""
+    from data.db import bars_table
     where = "WHERE threshold_pct = %(t)s"
     params: dict = {"t": threshold}
     if month_filter is not None:
@@ -215,7 +220,7 @@ def _load_bars(threshold: float, month_filter: Optional[date] = None) -> pd.Data
         params["e"] = next_m
     sql = f"""
         SELECT bar_id, bar_close_ts, close, high, low
-        FROM events.bars_btc_cusum
+        FROM {bars_table(symbol)}
         {where}
         ORDER BY bar_close_ts, bar_id
     """
@@ -373,22 +378,27 @@ def sanity_report(
 def run_label(
     month_filter: Optional[date] = None,
     dry_run: bool = False,
+    symbol: str = "BTC",
 ) -> dict:
+    """Build labels for one symbol; writes labels_{sym}.parquet (DR v3.0.14)."""
+    from data.db import symbol_short
+    sym = symbol_short(symbol)
     cfg = load_config()
     _check_frozen_params(cfg)
 
-    threshold = cfg["bars"]["threshold"]["BTC"]
-    tp_pct = cfg["labeling"]["tp_pct"]["BTC"]
-    sl_pct = cfg["labeling"]["sl_pct"]["BTC"]
+    threshold = cfg["bars"]["threshold"].get(sym.upper(), cfg["bars"]["threshold"]["BTC"])
+    tp_pct = cfg["labeling"]["tp_pct"].get(sym.upper(), cfg["labeling"]["tp_pct"]["BTC"])
+    sl_pct = cfg["labeling"]["sl_pct"].get(sym.upper(), cfg["labeling"]["sl_pct"]["BTC"])
     vertical_bars = cfg["labeling"]["vertical_bars"]
 
     output_dir = PROJECT_ROOT / "data" / "storage" / "labels"
-    output_path = output_dir / "labels_btc.parquet"
+    output_path = output_dir / f"labels_{sym}.parquet"
 
-    LOG.info("loading bars: threshold=%s month=%s",
-             threshold, f"{month_filter:%Y-%m}" if month_filter else "<all>")
+    LOG.info("loading bars: symbol=%s threshold=%s month=%s",
+             symbol, threshold,
+             f"{month_filter:%Y-%m}" if month_filter else "<all>")
     t0 = time.perf_counter()
-    bars = _load_bars(threshold, month_filter)
+    bars = _load_bars(threshold, month_filter, symbol=symbol)
     load_s = time.perf_counter() - t0
     LOG.info("loaded %d bars in %.1fs", len(bars), load_s)
 
@@ -428,6 +438,8 @@ def main(argv: list[str]) -> int:
                    "Disables hard-fail class-balance bounds.")
     p.add_argument("--dry-run", action="store_true",
                    help="Build in memory + report; do not write parquet.")
+    p.add_argument("--symbol", default="BTC",
+                   help="DR v3.0.14: asset symbol (BTC|ETH). Default BTC.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -435,12 +447,15 @@ def main(argv: list[str]) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    from data.db import symbol_short
+    sym = symbol_short(args.symbol).upper()
+
     month_filter: Optional[date] = None
     if args.month:
         month_filter = date.fromisoformat(args.month + "-01")
 
     try:
-        run_label(month_filter=month_filter, dry_run=args.dry_run)
+        run_label(month_filter=month_filter, dry_run=args.dry_run, symbol=sym)
     finally:
         close_pool()
     return 0

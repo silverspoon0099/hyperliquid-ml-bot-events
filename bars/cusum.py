@@ -153,13 +153,6 @@ def cusum_bars(
 # ─────────────────────────────────────────────────────────────────────
 # DB driver (DR v3.0.5 §1, §4)
 # ─────────────────────────────────────────────────────────────────────
-_BARS_INSERT_COPY = (
-    "COPY events.bars_btc_cusum "
-    "(bar_open_ts, bar_close_ts, open, high, low, close, volume, n_trades, "
-    " cusum_pos, cusum_neg, threshold_pct) "
-    "FROM STDIN WITH (FORMAT BINARY)"
-)
-
 _BARS_INSERT_TYPES = [
     "timestamptz", "timestamptz",
     "float8", "float8", "float8", "float8",
@@ -169,8 +162,20 @@ _BARS_INSERT_TYPES = [
 ]
 
 
-def _ticks_query(month_filter: Optional[date]) -> str:
+def _bars_insert_copy_sql(symbol: str = "BTC") -> str:
+    """COPY-FROM-STDIN target for bars table, parameterized by symbol (DR v3.0.14)."""
+    from data.db import bars_table
+    return (
+        f"COPY {bars_table(symbol)} "
+        "(bar_open_ts, bar_close_ts, open, high, low, close, volume, n_trades, "
+        " cusum_pos, cusum_neg, threshold_pct) "
+        "FROM STDIN WITH (FORMAT BINARY)"
+    )
+
+
+def _ticks_query(month_filter: Optional[date], symbol: str = "BTC") -> str:
     """Build the COPY-TO-STDOUT query body, optionally filtered to one month."""
+    from data.db import ticks_table
     where = ""
     if month_filter is not None:
         ms = month_filter.isoformat()
@@ -181,7 +186,7 @@ def _ticks_query(month_filter: Optional[date]) -> str:
         ).isoformat()
         where = f"WHERE ts >= '{ms}'::timestamptz AND ts < '{next_m}'::timestamptz "
     return (
-        "COPY (SELECT ts, price, qty FROM events.ticks_btc "
+        f"COPY (SELECT ts, price, qty FROM {ticks_table(symbol)} "
         f"{where}ORDER BY ts, agg_id) TO STDOUT (FORMAT BINARY)"
     )
 
@@ -191,16 +196,18 @@ def build_bars(
     max_duration_h: float = 168.0,
     month_filter: Optional[date] = None,
     dry_run: bool = False,
+    symbol: str = "BTC",
 ) -> dict:
     """Build all bars for one threshold; return a stats dict.
 
     If `month_filter` is set, restrict the source ticks to that calendar
     month. If `dry_run` is True, do not touch the bars table — stream,
-    compute, and report only.
+    compute, and report only. DR v3.0.14: `symbol` selects ticks/bars
+    table.
     """
     LOG.info(
-        "build_bars: threshold=%s max_duration_h=%s month=%s dry_run=%s",
-        threshold, max_duration_h,
+        "build_bars: symbol=%s threshold=%s max_duration_h=%s month=%s dry_run=%s",
+        symbol, threshold, max_duration_h,
         f"{month_filter:%Y-%m}" if month_filter else "<all>",
         dry_run,
     )
@@ -216,7 +223,7 @@ def build_bars(
 
     with get_connection() as conn:
         with conn.cursor() as cur:
-            with cur.copy(_ticks_query(month_filter)) as copy:
+            with cur.copy(_ticks_query(month_filter, symbol=symbol)) as copy:
                 copy.set_types(["timestamptz", "float8", "float8"])
                 for ts, price, qty in copy.rows():
                     cur_month = (ts.year, ts.month)
@@ -262,14 +269,15 @@ def build_bars(
         )
 
         if not dry_run:
+            from data.db import bars_table
             t1 = time.perf_counter()
             with conn.cursor() as cur:
                 cur.execute(
-                    "DELETE FROM events.bars_btc_cusum WHERE threshold_pct = %s",
+                    f"DELETE FROM {bars_table(symbol)} WHERE threshold_pct = %s",
                     (threshold,),
                 )
                 deleted = cur.rowcount
-                with cur.copy(_BARS_INSERT_COPY) as cp:
+                with cur.copy(_bars_insert_copy_sql(symbol)) as cp:
                     cp.set_types(_BARS_INSERT_TYPES)
                     for b in bars:
                         cp.write_row((
@@ -342,16 +350,18 @@ def _format_bar(b: Bar, threshold: float) -> str:
 # ─────────────────────────────────────────────────────────────────────
 # CLI entry point
 # ─────────────────────────────────────────────────────────────────────
-def sanity_report(threshold: float) -> None:
-    """Phase 0.2 post-build sanity report (DR v3.0.5 'Sanity checks')."""
-    print("\n========== Phase 0.2 Sanity Report ==========")
+def sanity_report(threshold: float, symbol: str = "BTC") -> None:
+    """Phase 0.2 post-build sanity report (DR v3.0.5 + DR v3.0.14 symbol-aware)."""
+    from data.db import bars_table
+    t = bars_table(symbol)
+    print(f"\n========== Phase 0.2 Sanity Report — symbol={symbol} ==========")
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("""
+            cur.execute(f"""
                 SELECT COUNT(*) AS n,
                        MIN(bar_open_ts)  AS first_open,
                        MAX(bar_close_ts) AS last_close
-                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+                FROM {t} WHERE threshold_pct = %s
             """, (threshold,))
             r = cur.fetchone()
             n_total = r["n"]
@@ -364,9 +374,9 @@ def sanity_report(threshold: float) -> None:
                 return
 
             # Bars per month
-            cur.execute("""
+            cur.execute(f"""
                 SELECT date_trunc('month', bar_close_ts) AS m, COUNT(*) AS n
-                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+                FROM {t} WHERE threshold_pct = %s
                 GROUP BY 1 ORDER BY 1
             """, (threshold,))
             month_rows = list(cur.fetchall())
@@ -382,12 +392,12 @@ def sanity_report(threshold: float) -> None:
                   f"median={sorted(counts)[len(counts)//2]}")
 
             # Close-reason distribution
-            cur.execute("""
+            cur.execute(f"""
                 SELECT
                     CASE WHEN GREATEST(cusum_pos, -cusum_neg) >= threshold_pct
                          THEN 'cusum' ELSE 'timeout' END AS reason,
                     COUNT(*) AS n
-                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+                FROM {t} WHERE threshold_pct = %s
                 GROUP BY 1
             """, (threshold,))
             print(f"\n--- Close-reason distribution ---")
@@ -402,9 +412,9 @@ def sanity_report(threshold: float) -> None:
                       f"threshold or fail-safe may be misconfigured")
 
             # Duration percentiles
-            cur.execute("""
+            cur.execute(f"""
                 SELECT EXTRACT(EPOCH FROM (bar_close_ts - bar_open_ts)) AS dur_s
-                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+                FROM {t} WHERE threshold_pct = %s
                 ORDER BY 1
             """, (threshold,))
             durations = [r["dur_s"] for r in cur.fetchall()]
@@ -421,13 +431,13 @@ def sanity_report(threshold: float) -> None:
                 print(f"  ERROR: max duration > 168h fail-safe — algorithm bug")
 
             # Bar invariants
-            cur.execute("""
+            cur.execute(f"""
                 SELECT
                     SUM((high < GREATEST(open, close))::int) AS bad_high,
                     SUM((low  > LEAST(open, close))::int)    AS bad_low,
                     SUM((n_trades < 1)::int)                 AS bad_n,
                     SUM((volume <= 0)::int)                  AS bad_vol
-                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+                FROM {t} WHERE threshold_pct = %s
             """, (threshold,))
             inv = cur.fetchone()
             print(f"\n--- Bar invariants ---")
@@ -440,7 +450,7 @@ def sanity_report(threshold: float) -> None:
             print(f"  ALL INVARIANTS OK: {ok}")
 
             # Determinism fingerprint — md5 over the canonical bar fields
-            cur.execute("""
+            cur.execute(f"""
                 SELECT md5(string_agg(
                     bar_open_ts::text  || '|' || bar_close_ts::text || '|' ||
                     open::text  || '|' || high::text  || '|' ||
@@ -449,7 +459,7 @@ def sanity_report(threshold: float) -> None:
                     cusum_pos::text || '|' || cusum_neg::text,
                     chr(10) ORDER BY bar_id
                 )) AS h
-                FROM events.bars_btc_cusum WHERE threshold_pct = %s
+                FROM {t} WHERE threshold_pct = %s
             """, (threshold,))
             print(f"\n--- Determinism fingerprint ---")
             print(f"  md5(bars) = {cur.fetchone()['h']}")
@@ -462,6 +472,8 @@ def main(argv: list[str]) -> int:
                    help="Limit ticks to one calendar month (smoke / debug).")
     p.add_argument("--dry-run", action="store_true",
                    help="Stream + compute + print; no DB writes.")
+    p.add_argument("--symbol", default="BTC",
+                   help="DR v3.0.14: asset symbol (BTC|ETH). Default BTC.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -469,14 +481,19 @@ def main(argv: list[str]) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    from data.db import symbol_short
+    sym = symbol_short(args.symbol).upper()
+
     cfg = load_config()
-    threshold = cfg["bars"]["threshold"]["BTC"]
+    # Threshold: per-symbol if defined, else fall back to BTC default
+    threshold = cfg["bars"]["threshold"].get(sym, cfg["bars"]["threshold"]["BTC"])
     max_duration_h = cfg["bars"]["max_bar_duration_hours"]
 
     init_schema(
         chunk_interval_ticks=cfg["database"]["chunk_interval_ticks"],
         compress_after_ticks=cfg["database"]["compress_after_ticks"],
         chunk_interval_bars=cfg["database"]["chunk_interval_bars"],
+        symbols=[sym],
     )
 
     month_filter: Optional[date] = None
@@ -489,10 +506,11 @@ def main(argv: list[str]) -> int:
             max_duration_h=max_duration_h,
             month_filter=month_filter,
             dry_run=args.dry_run,
+            symbol=sym,
         )
         print_summary(stats)
         if not args.dry_run:
-            sanity_report(threshold)
+            sanity_report(threshold, symbol=sym)
     finally:
         close_pool()
     return 0

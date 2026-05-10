@@ -57,29 +57,37 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def _load_features(tier1: bool = False) -> pd.DataFrame:
-    """Read features parquet. tier1=True loads the DR v3.0.13 extended set."""
-    if tier1:
-        path = PROJECT_ROOT / "data/storage/features/features_btc_tier1.parquet"
-    else:
-        path = PROJECT_ROOT / "data/storage/features/features_btc.parquet"
+def _load_features(tier1: bool = False, asset: str = "BTC") -> pd.DataFrame:
+    """Read features parquet. tier1=True loads the DR v3.0.13 extended set.
+    DR v3.0.14: asset=BTC|ETH selects features_{sym}.parquet."""
+    from data.db import symbol_short
+    sym = symbol_short(asset)
+    suffix = "_tier1" if tier1 else ""
+    path = PROJECT_ROOT / f"data/storage/features/features_{sym}{suffix}.parquet"
     return pd.read_parquet(path)
 
 
-def _load_labels() -> pd.DataFrame:
-    return pd.read_parquet(PROJECT_ROOT / "data/storage/labels/labels_btc.parquet")
+def _load_labels(asset: str = "BTC") -> pd.DataFrame:
+    """DR v3.0.14: asset=BTC|ETH selects labels_{sym}.parquet."""
+    from data.db import symbol_short
+    sym = symbol_short(asset)
+    return pd.read_parquet(PROJECT_ROOT / f"data/storage/labels/labels_{sym}.parquet")
 
 
-def _load_bars_close() -> pd.DataFrame:
-    sql = "SELECT bar_id, bar_close_ts, close FROM events.bars_btc_cusum ORDER BY bar_close_ts, bar_id"
+def _load_bars_close(asset: str = "BTC") -> pd.DataFrame:
+    from data.db import bars_table
+    sql = (f"SELECT bar_id, bar_close_ts, close FROM {bars_table(asset)} "
+           f"ORDER BY bar_close_ts, bar_id")
     return pd.read_sql_query(sql, get_engine())
 
 
-def _load_bars_ohlc() -> pd.DataFrame:
-    """Load full OHLC needed for in-memory relabeling (DR v3.0.11)."""
-    sql = """
+def _load_bars_ohlc(asset: str = "BTC") -> pd.DataFrame:
+    """Load full OHLC needed for in-memory relabeling (DR v3.0.11). DR v3.0.14
+    multi-asset: asset=BTC|ETH."""
+    from data.db import bars_table
+    sql = f"""
         SELECT bar_id, bar_open_ts, bar_close_ts, close, high, low
-        FROM events.bars_btc_cusum
+        FROM {bars_table(asset)}
         ORDER BY bar_close_ts, bar_id
     """
     return pd.read_sql_query(sql, get_engine())
@@ -238,7 +246,9 @@ def run_fold(
 def run(
     first_n: Optional[int] = None,
     dry_run: bool = False,
+    asset: str = "BTC",
 ) -> dict:
+    """L0 walk-forward for one asset (DR v3.0.14 multi-asset)."""
     cfg = _load_config()
     wf = cfg["walk_forward"]
     pg = cfg["pre_gate"]
@@ -247,10 +257,10 @@ def run(
     confidence_threshold = cfg["model"]["signal_threshold"]
     cost_bps_round_trip = bt["costs_bps_round_trip"]
 
-    LOG.info("loading features + labels + bars...")
-    feats = _load_features()
-    labels = _load_labels()
-    bars_close = _load_bars_close()
+    LOG.info("loading features + labels + bars (asset=%s)...", asset)
+    feats = _load_features(asset=asset)
+    labels = _load_labels(asset=asset)
+    bars_close = _load_bars_close(asset=asset)
 
     df_full = feats.merge(labels, on="bar_id", how="inner")
     df_full = df_full[df_full[LABEL_COL] != -1].copy()
@@ -337,7 +347,11 @@ def run(
         "aggregate": agg,
         "per_fold": fold_results,
     }
-    out_path = out_dir / "lgbm_results.json"
+    from data.db import symbol_short
+    sym = symbol_short(asset)
+    out["asset"] = asset
+    fname = "lgbm_results.json" if sym == "btc" else f"lgbm_results_{sym}.json"
+    out_path = out_dir / fname
     out_path.write_text(json.dumps(out, indent=2, default=str))
     LOG.info("wrote %s", out_path)
 
@@ -405,6 +419,7 @@ def print_sanity_report(out: dict) -> None:
 def run_threshold_sweep(
     first_n: Optional[int] = None,
     thresholds: tuple = (0.50, 0.52, 0.55, 0.58, 0.60),
+    asset: str = "BTC",
 ) -> dict:
     """DR v3.0.10: train once per fold, backtest 5 times across thresholds.
 
@@ -418,10 +433,10 @@ def run_threshold_sweep(
     lgbm_params = cfg["model"]["L0_lightgbm"]
     cost_bps_round_trip = bt["costs_bps_round_trip"]
 
-    LOG.info("loading features + labels + bars...")
-    feats = _load_features()
-    labels = _load_labels()
-    bars_close = _load_bars_close()
+    LOG.info("loading features + labels + bars (asset=%s)...", asset)
+    feats = _load_features(asset=asset)
+    labels = _load_labels(asset=asset)
+    bars_close = _load_bars_close(asset=asset)
 
     df_full = feats.merge(labels, on="bar_id", how="inner")
     df_full = df_full[df_full[LABEL_COL] != -1].copy()
@@ -637,6 +652,7 @@ def print_threshold_sweep_report(out: dict) -> None:
 def run_tb_sweep(
     first_n: Optional[int] = None,
     tb_values: tuple = (0.03, 0.04, 0.05, 0.06, 0.07),
+    asset: str = "BTC",
 ) -> dict:
     """DR v3.0.11: §16.4 step (1) TB sweep. In-memory relabel per TB,
     full L0 walk-forward at default 0.60 confidence threshold.
@@ -651,9 +667,9 @@ def run_tb_sweep(
     cost_bps_round_trip = bt["costs_bps_round_trip"]
     vertical_bars = cfg["labeling"]["vertical_bars"]
 
-    LOG.info("loading features + bars (with OHLC)...")
-    feats = _load_features()
-    bars_full = _load_bars_ohlc()
+    LOG.info("loading features + bars (asset=%s, with OHLC)...", asset)
+    feats = _load_features(asset=asset)
+    bars_full = _load_bars_ohlc(asset=asset)
     feature_cols = [c for c in feats.columns if c not in KEY_COLS]
 
     data_start = date(bars_full["bar_close_ts"].min().year,
@@ -672,7 +688,7 @@ def run_tb_sweep(
     )
     if first_n is not None:
         folds = folds[:first_n]
-    LOG.info("folds=%d  TB values=%s", len(folds), list(tb_values))
+    LOG.info("folds=%d  TB values=%s asset=%s", len(folds), list(tb_values), asset)
 
     by_tb: dict[str, dict] = {}
     t0_total = time.perf_counter()
@@ -847,6 +863,7 @@ def run_joint_tb_threshold_sweep(
     tb: float = 0.03,
     thresholds: tuple = (0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65),
     tier1: bool = False,
+    asset: str = "BTC",
 ) -> dict:
     """DR v3.0.12 / v3.0.13: TB=0.03 × threshold sweep. In-memory relabel
     once; training shared per fold; backtest per threshold. tier1=True
@@ -860,9 +877,10 @@ def run_joint_tb_threshold_sweep(
     cost_bps_round_trip = bt["costs_bps_round_trip"]
     vertical_bars = cfg["labeling"]["vertical_bars"]
 
-    LOG.info("loading features (tier1=%s) + bars (with OHLC)...", tier1)
-    feats = _load_features(tier1=tier1)
-    bars_full = _load_bars_ohlc()
+    LOG.info("loading features (tier1=%s, asset=%s) + bars (with OHLC)...",
+             tier1, asset)
+    feats = _load_features(tier1=tier1, asset=asset)
+    bars_full = _load_bars_ohlc(asset=asset)
     feature_cols = [c for c in feats.columns if c not in KEY_COLS]
 
     LOG.info("relabeling at TB=tp=sl=%.2f...", tb)
@@ -1008,8 +1026,12 @@ def run_joint_tb_threshold_sweep(
         "tier1_features": tier1,
         "feature_count": len(feature_cols),
     }
-    fname = ("joint_tb03_threshold_sweep_tier1.json"
-             if tier1 else "joint_tb03_threshold_sweep.json")
+    from data.db import symbol_short
+    sym = symbol_short(asset)
+    asset_suffix = "" if sym == "btc" else f"_{sym}"
+    tier1_suffix = "_tier1" if tier1 else ""
+    fname = f"joint_tb03_threshold_sweep{asset_suffix}{tier1_suffix}.json"
+    out["asset"] = asset
     out_path = PROJECT_ROOT / "reports" / "phase_1" / fname
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, indent=2, default=str))
@@ -1080,9 +1102,11 @@ def main(argv: list[str]) -> int:
                    help="DR v3.0.12: TB=0.03 × threshold sweep "
                         "across {0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65}.")
     p.add_argument("--tier1-features", action="store_true",
-                   help="DR v3.0.13: read features_btc_tier1.parquet "
-                        "(48 features) instead of features_btc.parquet "
+                   help="DR v3.0.13: read features_{sym}_tier1.parquet "
+                        "(48 features) instead of features_{sym}.parquet "
                         "(33 features). Used with --joint-sweep.")
+    p.add_argument("--asset", default="BTC",
+                   help="DR v3.0.14: asset symbol (BTC|ETH). Default BTC.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -1090,20 +1114,22 @@ def main(argv: list[str]) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    from data.db import symbol_short
+    asset = symbol_short(args.asset).upper()
     try:
         if args.joint_sweep:
             out = run_joint_tb_threshold_sweep(
-                first_n=args.first_n, tier1=args.tier1_features,
+                first_n=args.first_n, tier1=args.tier1_features, asset=asset,
             )
             print_joint_sweep_report(out)
         elif args.tb_sweep:
-            out = run_tb_sweep(first_n=args.first_n)
+            out = run_tb_sweep(first_n=args.first_n, asset=asset)
             print_tb_sweep_report(out)
         elif args.threshold_sweep:
-            out = run_threshold_sweep(first_n=args.first_n)
+            out = run_threshold_sweep(first_n=args.first_n, asset=asset)
             print_threshold_sweep_report(out)
         else:
-            out = run(first_n=args.first_n, dry_run=args.dry_run)
+            out = run(first_n=args.first_n, dry_run=args.dry_run, asset=asset)
             print_sanity_report(out)
     finally:
         close_pool()

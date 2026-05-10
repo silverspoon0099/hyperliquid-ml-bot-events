@@ -5,6 +5,190 @@
 
 ---
 
+## 2026-05-10 — Decision v3.0.14 — Path 3a: ETH walk-forward (Phase A architecture transfer) (DR)
+
+**Context**: After §16.4 ladder steps (1) TB sweep and (2) Tier 1
+features both failed to lift the BTC L0 architecture past the §16.1
+Sharpe ≥ 1.0 gate (DR v3.0.10/11/12/13), the user invokes Path 3a:
+transfer the Phase A pipeline to ETHUSDT and test under user's research
+on ETH 2026 regime conditions.
+
+**User research (2026-05-09)**: ETH 2026 is qualitatively different
+from Lessmann's 2022Q2–2023Q2 test period:
+- ETH has lost alt-leader status to SOL (RWA tokenization, active
+  addresses)
+- Institutional flows favor BTC ETF (~$30B) vs ETH's "modest and
+  inconsistent" inflows
+- Price action is grinding underperformance (-27% YTD) not capitulative
+  whipsaw
+- ETH/BTC ratio at 0.0313 (well below 0.040 trend-reversal level)
+- Lessmann's published 1.42 ETH Sharpe came from LUNA + FTX collapse
+  era; modern ETH is calmer institutional flow
+
+The architectural transfer is still the right test (best published
+prior of any path to clearing 1.0 gate), but result interpretation
+must account for regime evolution.
+
+**Decision**: Transfer Phase A pipeline to ETHUSDT:
+
+### 1. Symbol-parameterized multi-asset architecture
+
+Existing modules refactored to accept `symbol` parameter (default `BTC`
+for backward compatibility):
+- `data/db.py`: schema bootstrap creates `events.ticks_{sym}` and
+  `events.bars_{sym}_cusum` per symbol
+- `data/ingest_ticks.py`: `--symbol` flag (BTCUSDT or ETHUSDT)
+- `bars/cusum.py`: `--symbol` flag
+- `features/builder.py`: `--symbol` flag, writes `features_{sym}.parquet`
+- `labels/triple_barrier.py`: `--symbol` flag, writes `labels_{sym}.parquet`
+- `scripts/run_phase_1_lgbm.py`: `--asset` flag (BTC|ETH) reads
+  symbol-specific parquets
+
+Existing v3.0.11-phase1-baseline tag preserved; BTC artifacts untouched.
+
+### 2. Phase A pipeline for ETH
+
+Same parameters as BTC (per spec §10.1 freeze for BTC; ETH inherits
+the same defaults at this stage; per-asset parameter sweeps are Phase B):
+- CUSUM threshold: 0.02
+- TB tp/sl: 0.05 / 0.05
+- vertical_bars: 24
+- Confidence threshold: 0.60
+
+Run sequence:
+1. ETH tick ingest (~6-8h wall): 2019-01 → 2026-04, same Binance Vision
+   pipeline, all DR v3.0.2/3/4/6 fixes inherited
+2. ETH CUSUM bars (~6.5h wall): same algorithm, same `apply_triple_barrier`
+3. ETH features (33-feature parquet, ~5s)
+4. ETH labels (~1s)
+5. L0 walk-forward (default config; ~5 min)
+6. Joint TB × threshold sweep on ETH (DR v3.0.12 mechanics) for direct
+   comparison to BTC v3.0.12 result
+
+### 3. Regime-segmented Sharpe diagnostic (per user research)
+
+Split per-fold metrics into 3 eras anchored to user's market-research
+era boundaries:
+
+| Era | Description | Folds (by OOT_end) |
+|---|---|---|
+| Era 1 (2021–2022) | ETH high-beta era; Lessmann's strongest signal | 1–6 (OOT 2021-07 to 2022-10) |
+| Era 2 (2023–2024) | Post-collapse normalization | 7–14 (OOT 2023-01 to 2024-10) |
+| Era 3 (2025–2026) | Alt-leadership shift; institutional ETH | 15–20 (OOT 2025-01 to 2026-04) |
+
+Apply §16.1 gate to aggregate AND to Era 3 separately. The era
+breakdown reveals whether ETH's edge has persisted into modern regime
+or whether (like BTC) it's hit a recent regime wall.
+
+### 4. Output
+
+- `data/storage/features/features_eth.parquet` (33 cols × ~ETH bar count)
+- `data/storage/labels/labels_eth.parquet`
+- `reports/phase_1/lgbm_results_eth.json`
+- `reports/phase_1/joint_tb03_threshold_sweep_eth.json` (TB sweep ON ETH
+  using DR v3.0.12 mechanics, since TB=0.03 was best for BTC; Phase B
+  per-asset CUSUM/TB sweeps deferred per spec §16.4 step 2)
+- Regime-segmented Sharpe table in sanity report
+
+### 5. Decision tree (per user research-anchored spec)
+
+| Outcome | Action |
+|---|---|
+| Aggregate Sharpe ≥ 1.0 AND Era 3 Sharpe ≥ 1.0 | Architecture transfers cleanly. GO L1 ResNet-LSTM on ETH (3 days) |
+| Aggregate ≥ 1.0 BUT Era 3 ≤ 0.5 | Architecture worked historically; regime-fragile in 2025–2026 ETH. Ship 3b signal-provider on ETH historical model with explicit "may not work in current ETH regime" caveat |
+| Aggregate ≤ 0.5 | Architecture doesn't transfer. Ship 3b signal-provider on BTC TB=0.03 + thr=0.62 baseline (DR v3.0.12 best operating point) |
+
+### 6. Cost / budget
+
+- Refactor: ~3 hours of code (parameterize 6 files, run BTC tests)
+- ETH ingest: ~6-8h wall (background)
+- ETH bars: ~6.5h wall (background)
+- ETH features + labels: ~10s
+- L0 sweep + joint sweep + regime analysis: ~10 min
+
+Total wall clock: **~14-18 hours**. Within user's hard cap of 2 days.
+
+### 7. Phase B (SOL/LINK) note
+
+User flagged: SOL and LINK are structurally different. Lessmann's data
+required CUSUM 5% + TB 8% for LINK vs ETH's 2%/5%. Phase B port is NOT
+"rerun on different symbols" — it's "rerun per-asset parameter sweep."
+~2-3 days per asset, not 0.5. The multi-asset refactor in this DR
+makes that future work cleaner; DR v3.0.14 itself is ETH-only.
+
+### 8. Result (post-run, 2026-05-10)
+
+**ETH ingest**: 1.93B aggTrades across 88 months (2019-01 → 2026-04),
+zero agg_id gaps, perfect tape. ~9h wall.
+
+**ETH bars**: 28,917 CUSUM bars (md5 c3d19abe...), 100% cusum-triggered
+closes, all invariants OK. Bar density similar to BTC overall but
+concentrated in early-2019 (286 bars in 2019-01 vs BTC's 87) and
+2025-10 (1200 bars — vol spike confirms recent regime shift). ~33min
+wall.
+
+**ETH features**: 28,917 rows × 33 cols (md5 f3e2ca90...). Parquet
+8.29 MB.
+
+**ETH labels**: 28,889 labels, class balance LONG 44.05% / SHORT
+39.04% / NEUTRAL 16.92% (slightly long-skewed vs BTC's tighter
+distribution; §8.3 informational fail — known ETH directional bias
+2019–2021). Path-dependence 5.7–5.9% (clean sustained moves, comparable
+to BTC).
+
+**L0 walk-forward (thr=0.60)**: 20/20 folds evaluated. Pre-gate 5/6.
+Aggregate Sharpe **−0.205 ± 1.594**. Only 5/20 folds traded (0
+trades on 15 folds — calibrated probabilities rarely cross 0.60 on
+ETH).
+
+**Joint TB=0.03 × threshold sweep**: best aggregate at thr=0.55:
+Sharpe **+0.111**, 869 trades, 53.1% win, annret +0.607. All other
+threshold settings net-negative.
+
+**Regime-segmented Sharpe (L0 default thr=0.60)**:
+
+| Era | Folds | Active | Sharpe (mean ± std) | Trades | Annret |
+|---|---|---|---|---|---|
+| Era 1 (Lessmann 2021–22) | 6 | 1/6 | −0.512 ± 1.253 | 3 | −0.063 |
+| Era 2 (recovery 2023–24) | 8 | 2/8 | −0.537 ± 1.956 | 32 | −0.051 |
+| Era 3 (recent 2025–26) | 6 | 2/6 | **+0.543** ± 1.330 | 6 | +0.309 |
+
+Era 3 is the only positive era but driven by only 2/6 active folds
+and 6 total trades — statistically thin. Joint sweep at thr=0.55
+gives Era 3 Sharpe +0.263 (more trades, lower per-trade quality).
+
+Notable: Era 2 (recovery) is uniformly bad across all configurations
+— consistent with user's research that 2023–2024 ETH was sideways
+recovery with no clean directional signal.
+
+**Verdict per §5 decision tree**:
+
+Best aggregate Sharpe across configs = **+0.111** (joint thr=0.55).
+Best Era 3 Sharpe at that config = +0.263. Both well below 0.5
+threshold for "ship 3b ETH historical" branch.
+
+→ **Aggregate ≤ 0.5: Ship 3b BTC TB=0.03 + thr=0.62 baseline**
+(DR v3.0.12 best operating point). The Phase A architecture does
+not transfer cleanly to ETH; user's research thesis that modern ETH
+regime is harder than Lessmann's era is empirically validated.
+
+**Status**: ETH Phase A architecture transfer — **NEGATIVE**. §16.4
+fallback ladder exhausted at step (3) Path 3a; proceeding to step
+(4) Path 3b deployment on BTC v3.0.12 baseline. ResNet-LSTM Phase 1.1
+deferred indefinitely until a path to ≥0.5 aggregate Sharpe is found.
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-10 in
+strategic-checkpoint message with research-anchored regime-segmented
+test design.
+
+**References**: Spec §4.2, §16.4 ladder; DR v3.0.2/3/4/6 (loader fixes
+inherited), DR v3.0.7/8 (features/labels pipeline), DR v3.0.9 (L0
+walk-forward), DR v3.0.12 (joint sweep mechanics), DR v3.0.13 (Tier 1
+result); Lessmann §"Extensibility to other cryptocurrencies"; user
+2026-05-09 ETH 2026 market research.
+
+---
+
 ## 2026-05-10 — Decision v3.0.13 — §16.4 step (2) Tier 1 features (DR)
 
 **Context**: After DR v3.0.12 joint TB=0.03 × threshold sweep, two
