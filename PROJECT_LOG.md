@@ -5,6 +5,130 @@
 
 ---
 
+## 2026-05-10 — Decision v3.0.13 — §16.4 step (2) Tier 1 features (DR)
+
+**Context**: After DR v3.0.12 joint TB=0.03 × threshold sweep, two
+findings:
+
+- TB=0.03 + thr=0.62 is the most-robust operating point: 222 trades,
+  +84 bps mean, 67.9% win, Sharpe(nonzero) +1.477, 8 of 18 folds active.
+- Recent folds (14–20, OOT 2024-04 → 2026-04) are mostly inactive at
+  thr=0.62 and entirely inactive at thr=0.65 — suggests regime shift
+  between Lessmann's published era (2018–2023) and post-2024 BTC
+  (ETF era).
+
+Per spec §16.4 fallback ladder for "Phase A passes pre-gate but Sharpe
+< 1.0" → step (2) "feature additions per §7.2". This DR executes step
+(2) with all 4 §7.2 candidate categories.
+
+**Decision**: Add 15 new features to a new parquet
+`features_btc_tier1.parquet` (existing `features_btc.parquet`
+unchanged; tag `v3.0.11-phase1-baseline` preserved). 33 → 48 columns.
+
+### New feature inventory (per §7.2 evidence-strength order)
+
+**(1) Event-memory — `bars_since_*` (6 features)**
+30m project's strongest tabular signal per spec §7.2. Computed from
+existing features parquet:
+- `bars_since_rsi_ob_14` — bars since `rsi_14 > 70`
+- `bars_since_rsi_os_14` — bars since `rsi_14 < 30`
+- `bars_since_macd_cross` — bars since `macd_line` sign-flipped
+- `bars_since_volume_spike` — bars since `volume > rolling_50_median × 3`
+- `bars_since_close_gt_ema50` — bars since `close > ema_50`
+- `bars_since_close_lt_ema50` — bars since `close < ema_50`
+
+`close` re-loaded from `events.bars_btc_cusum` (not in features parquet).
+
+**(2) HTF context — log-returns at standard horizons (3 features)**
+Lessmann's primary feature category in the 30m project's top-20.
+Implementation: `merge_asof` lookup of close-price-at-time-T-X for
+each bar at time T:
+- `htf_ret_4h` = `log(close[T] / close[bar_close_ts ≤ T − 4h])`
+- `htf_ret_1d` = `log(close[T] / close[bar_close_ts ≤ T − 24h])`
+- `htf_ret_5d` = `log(close[T] / close[bar_close_ts ≤ T − 5d])`
+
+Simpler than full 4H/1D EMA pipeline (which would need new HTF bar
+table); captures the same "where is price relative to recent-history"
+information.
+
+**(3) Volatility regime — ATR + percentile (2 features)**
+Addresses Lessmann-documented low-vol weakness + user's recent-fold
+inactivity observation. `high - low` from bars table:
+- `atr_14` = mean(high − low) over rolling 14 bars
+- `atr_pct_rank_100` = percentile rank of `atr_14` over rolling 100 bars
+
+`atr_pct_rank_100` is the regime-classifier-equivalent — tells the
+model "which volatility regime is this."
+
+**(4) Pivot proximity — Fibonacci (4 features)**
+User's chart-reading observation per §7.2. Daily-aggregated H/L/C from
+CUSUM bars; pivot point P = (H_d + L_d + C_d) / 3:
+- `pivot_distance` = `log(close / P)`
+- `r1_distance` = `log(close / R1)` where `R1 = 2P − L_d`
+- `s1_distance` = `log(close / S1)` where `S1 = 2P − H_d`
+- `fib_618_distance` = `log(close / fib_618)` where `fib_618 = P + 0.618 × (H_d − L_d)`
+
+Forward-deterministic from prior period H/L/C; no leakage.
+
+### Mechanics
+
+`features/tier1_builder.py`:
+1. Load `features_btc.parquet` (33 cols)
+2. Load `events.bars_btc_cusum` (bar_id, bar_close_ts, close, high, low)
+3. Compute the 15 new features, merge on `bar_id`
+4. Write `data/storage/features/features_btc_tier1.parquet` (48 cols)
+
+`scripts/run_phase_1_lgbm.py` extended with `--tier1-features` flag
+that switches `_load_features()` to read the tier1 parquet.
+
+### Output
+
+- `data/storage/features/features_btc_tier1.parquet` (48 features × 18,629 bars)
+- `reports/phase_1/joint_tb03_threshold_sweep_tier1.json` — same schema as
+  DR v3.0.12 output, for direct apples-to-apples comparison
+- Side-by-side report: per-threshold aggregates with Δ vs
+  v3.0.12 baseline; per-fold n_trades comparison; top-10 feature
+  importance (do new features rank?)
+
+### CLI
+
+```
+python -m features.tier1_builder                 # build extended parquet
+python -m scripts.run_phase_1_lgbm --joint-sweep --tier1-features
+```
+
+### Why safe
+
+- Existing features parquet untouched; v3.0.11-phase1-baseline tag pinned
+- §10.1 frozen Phase A parameters unchanged (CUSUM 0.02, TB 0.05/0.05 in
+  config; this DR uses TB=0.03 in-memory only via the joint-sweep
+  mechanics from DR v3.0.11/v3.0.12)
+- Pivot features' "prior period H/L/C" are deterministic from past
+  bars only — no future leakage (validated by leakage-detection test
+  pattern from DR v3.0.9 §16(a) if needed)
+
+### Decision tree on result
+
+| Outcome (vs v3.0.12 baseline at TB=0.03 + thr=0.62) | Action |
+|---|---|
+| Sharpe lift ≥ +0.3 AND ≥ 4 of 7 recent folds (14–20) activate | Strong evidence — proceed to Tier 2 (full HTF EMA pipeline) or strategic L1 conversation |
+| Sharpe lift +0.1–0.3 OR recent-fold activation modest | Modest improvement; commit to signal-provider on extended-feature TB=0.03+thr=0.62 baseline; skip L1 |
+| Sharpe negligible / regresses; new features don't rank in top-10 | Features aren't load-bearing for this architecture; revert to 33-feature baseline; ship 3b signal-provider on DR v3.0.12 best operating point |
+
+Top-10 feature importance is the second key diagnostic: if the new 15
+features don't rank in top-10 in any fold, the additions don't carry
+signal regardless of Sharpe movement.
+
+**Approver**: User (`silverspoon0099`) — approved 2026-05-10 in
+strategic message; mechanics + 4-category scope + thr=0.62 evaluation
+point specified by user.
+
+**References**: Spec §7.2 feature candidates, §16.4 step (2);
+DR v3.0.7 (features baseline), DR v3.0.11 (TB sweep), DR v3.0.12
+(joint sweep result); 30m v2.0 project (`bars_since_*` validation).
+
+---
+
 ## 2026-05-09 — Decision v3.0.12 — Joint TB=0.03 × threshold sweep (DR)
 
 **Context**: DR v3.0.11 TB sweep result (commit `08edee0`,

@@ -57,8 +57,13 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def _load_features() -> pd.DataFrame:
-    return pd.read_parquet(PROJECT_ROOT / "data/storage/features/features_btc.parquet")
+def _load_features(tier1: bool = False) -> pd.DataFrame:
+    """Read features parquet. tier1=True loads the DR v3.0.13 extended set."""
+    if tier1:
+        path = PROJECT_ROOT / "data/storage/features/features_btc_tier1.parquet"
+    else:
+        path = PROJECT_ROOT / "data/storage/features/features_btc.parquet"
+    return pd.read_parquet(path)
 
 
 def _load_labels() -> pd.DataFrame:
@@ -841,9 +846,11 @@ def run_joint_tb_threshold_sweep(
     first_n: Optional[int] = None,
     tb: float = 0.03,
     thresholds: tuple = (0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65),
+    tier1: bool = False,
 ) -> dict:
-    """DR v3.0.12: TB=0.03 × threshold sweep. In-memory relabel once;
-    training shared per fold; backtest per threshold."""
+    """DR v3.0.12 / v3.0.13: TB=0.03 × threshold sweep. In-memory relabel
+    once; training shared per fold; backtest per threshold. tier1=True
+    reads the extended 48-feature parquet."""
     from labels.triple_barrier import apply_triple_barrier
 
     cfg = _load_config()
@@ -853,8 +860,8 @@ def run_joint_tb_threshold_sweep(
     cost_bps_round_trip = bt["costs_bps_round_trip"]
     vertical_bars = cfg["labeling"]["vertical_bars"]
 
-    LOG.info("loading features + bars (with OHLC)...")
-    feats = _load_features()
+    LOG.info("loading features (tier1=%s) + bars (with OHLC)...", tier1)
+    feats = _load_features(tier1=tier1)
     bars_full = _load_bars_ohlc()
     feature_cols = [c for c in feats.columns if c not in KEY_COLS]
 
@@ -988,6 +995,9 @@ def run_joint_tb_threshold_sweep(
             "per_fold": fold_rows,
         }
 
+    # Capture per-threshold top-10 feature importance from the LAST fold
+    # we trained (representative) — re-runs training-free is too cumbersome
+    # at this nesting; we already log per-fold during the loop.
     out = {
         "tb": tb,
         "thresholds_swept": list(thresholds),
@@ -995,8 +1005,12 @@ def run_joint_tb_threshold_sweep(
         "n_folds_evaluated": n_evaluated,
         "wall_clock_seconds": total_s,
         "by_threshold": results,
+        "tier1_features": tier1,
+        "feature_count": len(feature_cols),
     }
-    out_path = PROJECT_ROOT / "reports" / "phase_1" / "joint_tb03_threshold_sweep.json"
+    fname = ("joint_tb03_threshold_sweep_tier1.json"
+             if tier1 else "joint_tb03_threshold_sweep.json")
+    out_path = PROJECT_ROOT / "reports" / "phase_1" / fname
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, indent=2, default=str))
     LOG.info("wrote %s", out_path)
@@ -1065,6 +1079,10 @@ def main(argv: list[str]) -> int:
     p.add_argument("--joint-sweep", action="store_true",
                    help="DR v3.0.12: TB=0.03 × threshold sweep "
                         "across {0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65}.")
+    p.add_argument("--tier1-features", action="store_true",
+                   help="DR v3.0.13: read features_btc_tier1.parquet "
+                        "(48 features) instead of features_btc.parquet "
+                        "(33 features). Used with --joint-sweep.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -1074,7 +1092,9 @@ def main(argv: list[str]) -> int:
 
     try:
         if args.joint_sweep:
-            out = run_joint_tb_threshold_sweep(first_n=args.first_n)
+            out = run_joint_tb_threshold_sweep(
+                first_n=args.first_n, tier1=args.tier1_features,
+            )
             print_joint_sweep_report(out)
         elif args.tb_sweep:
             out = run_tb_sweep(first_n=args.first_n)
