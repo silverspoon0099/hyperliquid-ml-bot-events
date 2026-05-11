@@ -653,9 +653,13 @@ def run_tb_sweep(
     first_n: Optional[int] = None,
     tb_values: tuple = (0.03, 0.04, 0.05, 0.06, 0.07),
     asset: str = "BTC",
+    out_name: str = "tb_sweep.json",
 ) -> dict:
     """DR v3.0.11: §16.4 step (1) TB sweep. In-memory relabel per TB,
     full L0 walk-forward at default 0.60 confidence threshold.
+
+    DR v3.0.15: accepts fractional TB values (e.g., 0.035, 0.045) via
+    .3f keying; custom out_name for fill-in runs.
     """
     from labels.triple_barrier import apply_triple_barrier
 
@@ -775,7 +779,7 @@ def run_tb_sweep(
         any_long_folds = [r for r in fold_rows if r["n_long"] > 0]
         any_short_folds = [r for r in fold_rows if r["n_short"] > 0]
 
-        by_tb[f"{tb:.2f}"] = {
+        by_tb[f"{tb:.3f}"] = {
             "aggregate": {
                 "n_trades_total": n_total_trades,
                 "trades_per_fold_mean": n_total_trades / max(len(fold_rows), 1),
@@ -793,11 +797,11 @@ def run_tb_sweep(
             },
             "per_fold": fold_rows,
         }
-        LOG.info("TB %.2f done in %.1fs: n_trades=%d sharpe(all)=%.3f sharpe(!=0)=%.3f",
+        LOG.info("TB %.3f done in %.1fs: n_trades=%d sharpe(all)=%.3f sharpe(!=0)=%.3f",
                  tb, time.perf_counter() - t_tb,
                  n_total_trades,
-                 by_tb[f"{tb:.2f}"]["aggregate"]["sharpe_mean_across_folds"],
-                 by_tb[f"{tb:.2f}"]["aggregate"]["sharpe_mean_nonzero_folds"])
+                 by_tb[f"{tb:.3f}"]["aggregate"]["sharpe_mean_across_folds"],
+                 by_tb[f"{tb:.3f}"]["aggregate"]["sharpe_mean_nonzero_folds"])
 
     total_s = time.perf_counter() - t0_total
     out = {
@@ -806,7 +810,7 @@ def run_tb_sweep(
         "wall_clock_seconds": total_s,
         "by_tb": by_tb,
     }
-    out_path = PROJECT_ROOT / "reports" / "phase_1" / "tb_sweep.json"
+    out_path = PROJECT_ROOT / "reports" / "phase_1" / out_name
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, indent=2, default=str))
     LOG.info("wrote %s", out_path)
@@ -820,14 +824,14 @@ def print_tb_sweep_report(out: dict) -> None:
     print(f"TB values swept: {out['tb_values_swept']}")
 
     print("\n--- Side-by-side aggregates (default 0.60 confidence threshold) ---")
-    header = (f"  {'TB':>5}  {'n_trd':>6}  {'tr/fld':>7}  {'0-tr':>5}  "
+    header = (f"  {'TB':>6}  {'n_trd':>6}  {'tr/fld':>7}  {'0-tr':>5}  "
               f"{'mPnL':>9}  {'medPnL':>10}  {'win%':>6}  "
               f"{'L_win%':>7}  {'S_win%':>7}  {'Shp_all':>8}  {'Shp_!=0':>8}  {'annret':>7}")
     print(header)
     print("  " + "-" * (len(header) - 2))
     for tb in out["tb_values_swept"]:
-        a = out["by_tb"][f"{tb:.2f}"]["aggregate"]
-        print(f"  {tb:>5.2f}  "
+        a = out["by_tb"][f"{tb:.3f}"]["aggregate"]
+        print(f"  {tb:>6.3f}  "
               f"{a['n_trades_total']:>6}  "
               f"{a['trades_per_fold_mean']:>7.1f}  "
               f"{a['n_folds_zero_trades']:>5}  "
@@ -842,14 +846,14 @@ def print_tb_sweep_report(out: dict) -> None:
 
     print("\n--- Per-fold n_trades by TB ---")
     if out["tb_values_swept"]:
-        first_tb_str = f"{out['tb_values_swept'][0]:.2f}"
+        first_tb_str = f"{out['tb_values_swept'][0]:.3f}"
         fold_ids = [r["fold"] for r in out["by_tb"][first_tb_str]["per_fold"]]
-        print(f"  fold  " + "  ".join(f"TB={tb:.2f}" for tb in out["tb_values_swept"]))
+        print(f"  fold  " + "  ".join(f"TB={tb:.3f}" for tb in out["tb_values_swept"]))
         for i, fold_id in enumerate(fold_ids):
             row = []
             for tb in out["tb_values_swept"]:
-                n = out["by_tb"][f"{tb:.2f}"]["per_fold"][i]["n_trades"]
-                row.append(f"{n:>6}")
+                n = out["by_tb"][f"{tb:.3f}"]["per_fold"][i]["n_trades"]
+                row.append(f"{n:>7}")
             print(f"  {fold_id:>4}  " + "  ".join(row))
 
     print("\n--- Interpretation note ---")
@@ -1098,6 +1102,12 @@ def main(argv: list[str]) -> int:
     p.add_argument("--tb-sweep", action="store_true",
                    help="DR v3.0.11: §16.4 step (1) — sensitivity analysis "
                         "across TB ∈ {0.03, 0.04, 0.05, 0.06, 0.07}.")
+    p.add_argument("--tb-values", default=None,
+                   help="DR v3.0.15: comma-separated custom TB values "
+                        "(e.g., '0.035,0.045'). Used with --tb-sweep.")
+    p.add_argument("--tb-out-name", default="tb_sweep.json",
+                   help="DR v3.0.15: output JSON filename in reports/phase_1/. "
+                        "Used with --tb-sweep.")
     p.add_argument("--joint-sweep", action="store_true",
                    help="DR v3.0.12: TB=0.03 × threshold sweep "
                         "across {0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65}.")
@@ -1123,7 +1133,11 @@ def main(argv: list[str]) -> int:
             )
             print_joint_sweep_report(out)
         elif args.tb_sweep:
-            out = run_tb_sweep(first_n=args.first_n, asset=asset)
+            tb_kwargs: dict = {"first_n": args.first_n, "asset": asset,
+                               "out_name": args.tb_out_name}
+            if args.tb_values:
+                tb_kwargs["tb_values"] = tuple(float(v) for v in args.tb_values.split(","))
+            out = run_tb_sweep(**tb_kwargs)
             print_tb_sweep_report(out)
         elif args.threshold_sweep:
             out = run_threshold_sweep(first_n=args.first_n, asset=asset)

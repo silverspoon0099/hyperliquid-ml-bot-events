@@ -5,6 +5,79 @@
 
 ---
 
+## 2026-05-11 — Decision v3.0.15 — TB sweep fill-in (0.035, 0.045) (DR)
+
+**Context**: DR v3.0.11 swept TB ∈ {0.03, 0.04, 0.05, 0.06, 0.07}
+and found TB=0.03 as winner (Sharpe(!=0) +0.564, mPnL +48 bps,
+56.2% win, 351 trades, 10 zero-trade folds). The 0.03→0.04
+transition is steep (Sharpe drops from +0.564 to −0.344), implying
+non-monotonic curve with a trough at 0.04. The 0.035 and 0.045
+grid points were not tested.
+
+**Decision**: Run TB ∈ {0.035, 0.045} as extension of DR v3.0.11
+sweep. Symmetric barriers only, default threshold 0.60, same 18-fold
+walk-forward, same in-memory relabel pattern. Mechanics:
+
+- New CLI flags on `scripts/run_phase_1_lgbm.py`:
+  - `--tb-values "0.035,0.045"` (comma-separated)
+  - `--tb-out-name "tb_sweep_extended.json"`
+- `by_tb` dict keys switched from `.2f` to `.3f` format
+  (so 0.035 doesn't collide with 0.04). No existing consumer affected
+  — only `run_phase_1_lgbm.py` itself read the old keys.
+
+### Result (post-run, 2026-05-11)
+
+Wall clock: 233.3s. Combined v3.0.11 + v3.0.15 table (TB ascending):
+
+| TB | n_trades | active folds | mPnL bps | medPnL | win% | L win% | S win% | Sharpe(!=0) | Sharpe(all) | annret |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 0.030 | 351 | 8/18 | +48.00 | +110.27 | 56.2 | 57.6 | 64.7 | **+0.564** | +0.251 | +4.083 |
+| **0.035** | **340** | **11/18** | **+21.46** | **+25.04** | **51.5** | **56.8** | **39.5** | **+0.161** | **+0.098** | **+0.420** |
+| 0.040 | 169 | 8/18 | −23.98 | +43.84 | 48.0 | 57.2 | 35.0 | −0.344 | −0.153 | +0.040 |
+| **0.045** | **100** | **5/18** | **+73.32** | **+263.81** | **58.0** | **69.3** | **21.4** | **+0.732** | **+0.203** | **+0.097** |
+| 0.050 | 92 | 5/18 | +10.05 | +33.92 | 50.2 | 65.8 | 25.0 | −0.328 | −0.091 | +0.053 |
+| 0.060 | 5 | 2/18 | +155.13 | +131.68 | 62.5 | 100.0 | 0.0 | −1.457 | −0.081 | −0.014 |
+| 0.070 | 0 | 0/18 | 0 | 0 | 0 | 0 | 0 | 0 | 0 | 0 |
+
+**Curve shape**: Sharpe(!=0) is non-monotonic with a clear trough at
+TB=0.04: peak at 0.030 (+0.564), monotonic decline to 0.035 (+0.161)
+to 0.040 (−0.344), then a thin-sample bump at 0.045 (+0.732 on only
+100 trades / 5 active folds), back down at 0.050 (−0.328) and worse
+beyond. The 0.035 point is on the slope down from the 0.030 peak —
+it does NOT extend the 0.030 sweet spot.
+
+### Decision tree applied
+
+| Branch | Trigger | Hit? |
+|---|---|---|
+| TB=0.035 Sharpe(!=0) ≥ +0.6 AND mPnL ≥ +50 bps AND n_trades ≥ 200 | new 3b baseline candidate | NO — Sharpe +0.161 |
+| TB=0.035 Sharpe(!=0) ∈ [+0.45, +0.6] | marginal — fold-coverage decision | NO — Sharpe +0.161 |
+| TB=0.035 Sharpe(!=0) < +0.45 | confirms 0.04 trough extends to 0.035; TB=0.03 stays as 3b baseline | **HIT** — Sharpe +0.161 |
+
+**Note on TB=0.045**: Sharpe(!=0) +0.732 is informational only.
+With only 100 trades across 5/18 active folds (median trades/fold = 0
+since 13 folds have zero), the result is dominated by 1-2 favorable
+folds (fold 16 with 34 trades, fold 12 with 39 trades). The 0-trade
+folds being filtered from Sharpe(!=0) inflates the headline.
+Sharpe(all 18 folds) = +0.203, which is the meaningful aggregate
+and is not competitive with TB=0.030 (+0.251). No further action
+on TB=0.045 per user direction.
+
+### Verdict
+
+**TB=0.03 stays as 3b baseline.** No change to DR v3.0.12 best
+operating point (TB=0.03 + thr=0.62). §16.4 fallback ladder remains
+exhausted; next operational step is Path 3b deployment on v3.0.12
+baseline as decided in DR v3.0.14.
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-11 in
+strategic-checkpoint message with decision tree.
+
+**References**: Spec §16.4 step (1); DR v3.0.11 (original sweep), DR
+v3.0.12 (current 3b baseline), DR v3.0.14 (Path 3a ETH outcome).
+
+---
+
 ## 2026-05-10 — Decision v3.0.14 — Path 3a: ETH walk-forward (Phase A architecture transfer) (DR)
 
 **Context**: After §16.4 ladder steps (1) TB sweep and (2) Tier 1
