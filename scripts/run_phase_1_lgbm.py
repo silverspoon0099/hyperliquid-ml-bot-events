@@ -57,12 +57,21 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def _load_features(tier1: bool = False, asset: str = "BTC") -> pd.DataFrame:
-    """Read features parquet. tier1=True loads the DR v3.0.13 extended set.
-    DR v3.0.14: asset=BTC|ETH selects features_{sym}.parquet."""
+def _load_features(tier1: bool = False, v2: bool = False, asset: str = "BTC") -> pd.DataFrame:
+    """Read features parquet.
+    - tier1=True: DR v3.0.13 extended 48-feature set
+    - v2=True:    DR v3.0.16 order-flow + HTF 41-feature set
+    DR v3.0.14: asset=BTC|ETH selects features_{sym}{suffix}.parquet."""
     from data.db import symbol_short
     sym = symbol_short(asset)
-    suffix = "_tier1" if tier1 else ""
+    if tier1 and v2:
+        raise ValueError("--tier1-features and --v2-features are mutually exclusive")
+    if tier1:
+        suffix = "_tier1"
+    elif v2:
+        suffix = "_v2"
+    else:
+        suffix = ""
     path = PROJECT_ROOT / f"data/storage/features/features_{sym}{suffix}.parquet"
     return pd.read_parquet(path)
 
@@ -247,8 +256,9 @@ def run(
     first_n: Optional[int] = None,
     dry_run: bool = False,
     asset: str = "BTC",
+    v2: bool = False,
 ) -> dict:
-    """L0 walk-forward for one asset (DR v3.0.14 multi-asset)."""
+    """L0 walk-forward for one asset (DR v3.0.14 multi-asset; v3.0.16 v2 features)."""
     cfg = _load_config()
     wf = cfg["walk_forward"]
     pg = cfg["pre_gate"]
@@ -257,8 +267,8 @@ def run(
     confidence_threshold = cfg["model"]["signal_threshold"]
     cost_bps_round_trip = bt["costs_bps_round_trip"]
 
-    LOG.info("loading features + labels + bars (asset=%s)...", asset)
-    feats = _load_features(asset=asset)
+    LOG.info("loading features (v2=%s) + labels + bars (asset=%s)...", v2, asset)
+    feats = _load_features(v2=v2, asset=asset)
     labels = _load_labels(asset=asset)
     bars_close = _load_bars_close(asset=asset)
 
@@ -350,7 +360,12 @@ def run(
     from data.db import symbol_short
     sym = symbol_short(asset)
     out["asset"] = asset
-    fname = "lgbm_results.json" if sym == "btc" else f"lgbm_results_{sym}.json"
+    out["v2_features"] = v2
+    asset_suffix = "" if sym == "btc" else f"_{sym}"
+    feat_suffix = "_v2" if v2 else ""
+    fname = f"lgbm_results{asset_suffix}{feat_suffix}.json"
+    if sym == "btc" and not v2:
+        fname = "lgbm_results.json"
     out_path = out_dir / fname
     out_path.write_text(json.dumps(out, indent=2, default=str))
     LOG.info("wrote %s", out_path)
@@ -867,11 +882,13 @@ def run_joint_tb_threshold_sweep(
     tb: float = 0.03,
     thresholds: tuple = (0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65),
     tier1: bool = False,
+    v2: bool = False,
     asset: str = "BTC",
 ) -> dict:
-    """DR v3.0.12 / v3.0.13: TB=0.03 × threshold sweep. In-memory relabel
-    once; training shared per fold; backtest per threshold. tier1=True
-    reads the extended 48-feature parquet."""
+    """DR v3.0.12 / v3.0.13 / v3.0.16: TB=0.03 × threshold sweep. In-memory
+    relabel once; training shared per fold; backtest per threshold.
+    tier1=True reads features_{sym}_tier1.parquet (48 cols).
+    v2=True reads features_{sym}_v2.parquet (41 cols, DR v3.0.16)."""
     from labels.triple_barrier import apply_triple_barrier
 
     cfg = _load_config()
@@ -881,9 +898,9 @@ def run_joint_tb_threshold_sweep(
     cost_bps_round_trip = bt["costs_bps_round_trip"]
     vertical_bars = cfg["labeling"]["vertical_bars"]
 
-    LOG.info("loading features (tier1=%s, asset=%s) + bars (with OHLC)...",
-             tier1, asset)
-    feats = _load_features(tier1=tier1, asset=asset)
+    LOG.info("loading features (tier1=%s, v2=%s, asset=%s) + bars (with OHLC)...",
+             tier1, v2, asset)
+    feats = _load_features(tier1=tier1, v2=v2, asset=asset)
     bars_full = _load_bars_ohlc(asset=asset)
     feature_cols = [c for c in feats.columns if c not in KEY_COLS]
 
@@ -1028,13 +1045,19 @@ def run_joint_tb_threshold_sweep(
         "wall_clock_seconds": total_s,
         "by_threshold": results,
         "tier1_features": tier1,
+        "v2_features": v2,
         "feature_count": len(feature_cols),
     }
     from data.db import symbol_short
     sym = symbol_short(asset)
     asset_suffix = "" if sym == "btc" else f"_{sym}"
-    tier1_suffix = "_tier1" if tier1 else ""
-    fname = f"joint_tb03_threshold_sweep{asset_suffix}{tier1_suffix}.json"
+    if tier1:
+        feat_suffix = "_tier1"
+    elif v2:
+        feat_suffix = "_v2"
+    else:
+        feat_suffix = ""
+    fname = f"joint_tb03_threshold_sweep{asset_suffix}{feat_suffix}.json"
     out["asset"] = asset
     out_path = PROJECT_ROOT / "reports" / "phase_1" / fname
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1115,6 +1138,10 @@ def main(argv: list[str]) -> int:
                    help="DR v3.0.13: read features_{sym}_tier1.parquet "
                         "(48 features) instead of features_{sym}.parquet "
                         "(33 features). Used with --joint-sweep.")
+    p.add_argument("--v2-features", action="store_true",
+                   help="DR v3.0.16: read features_{sym}_v2.parquet "
+                        "(41 features = 33 + 5 order flow + 3 HTF). "
+                        "Mutually exclusive with --tier1-features.")
     p.add_argument("--asset", default="BTC",
                    help="DR v3.0.14: asset symbol (BTC|ETH). Default BTC.")
     args = p.parse_args(argv[1:])
@@ -1129,7 +1156,8 @@ def main(argv: list[str]) -> int:
     try:
         if args.joint_sweep:
             out = run_joint_tb_threshold_sweep(
-                first_n=args.first_n, tier1=args.tier1_features, asset=asset,
+                first_n=args.first_n, tier1=args.tier1_features,
+                v2=args.v2_features, asset=asset,
             )
             print_joint_sweep_report(out)
         elif args.tb_sweep:
@@ -1143,7 +1171,8 @@ def main(argv: list[str]) -> int:
             out = run_threshold_sweep(first_n=args.first_n, asset=asset)
             print_threshold_sweep_report(out)
         else:
-            out = run(first_n=args.first_n, dry_run=args.dry_run, asset=asset)
+            out = run(first_n=args.first_n, dry_run=args.dry_run, asset=asset,
+                      v2=args.v2_features)
             print_sanity_report(out)
     finally:
         close_pool()

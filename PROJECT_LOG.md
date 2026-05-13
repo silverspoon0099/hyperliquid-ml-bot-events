@@ -5,6 +5,192 @@
 
 ---
 
+## 2026-05-13 — Decision v3.0.16 — v2 information features (order flow + HTF) (DR)
+
+**Context**: After DRs v3.0.9–v3.0.15 hit a ~0.25 aggregate Sharpe
+ceiling on BTC and v3.0.14 confirmed Path 3a ETH transfer failed
+(best +0.111), the user requested a deep-research-anchored pivot to
+test the four candidate ceilings (information / model / labeling /
+costs). Priority: information additions first ("Test 1").
+
+**Hypothesis**: The 33-feature Lessmann set is technical-only and
+misses (a) trade-level order flow (buy/sell aggressor split from raw
+aggTrades), (b) higher-timeframe context (daily return, weekly range
+position, vol regime ratio). Adding 8 features tests whether the
+ceiling is information-limited.
+
+### 1. Scope adjustment (mid-run)
+
+Initial DR v3.0.16 spec included a 3-feature funding-rate group
+(Group C). Schema check 2026-05-11: `data/storage/hyperliquid/`
+does not exist and funding history has never been ingested. Group C
+deferred to a future DR. Final v2 set is 8 features (5 order flow +
+3 HTF), giving a 41-feature parquet.
+
+Initial scope was full-history (2019–2026) tick-level order flow.
+First build attempt: pandas+psycopg `read_sql_query` → 100k ticks/s
+→ projected 10+ hours wall clock. Switched to server-side SQL
+aggregation: 21.6s for one month (Jan 2019, 6M ticks). But the
+inequality range-join (`t.ts > b.bar_open_ts AND t.ts <= b.bar_close_ts`)
+forces PostgreSQL nested-loop. Bull-run months with 65–170M ticks
+took 30+ minutes each; a 9-hour build was killed at month 49/89 with
+no output saved.
+
+**Final adopted strategy**: `psycopg cursor.copy()` streaming TEXT
+format → pandas in-memory → numpy `searchsorted` for bar assignment.
+Throughput stabilized at **~480k ticks/s** (5× the read_sql approach
+and 2× faster than server-side SQL join). For the recent-regime scope
+(2024-01 → 2026-05, ~28 months, 1.07B ticks), this completed in
+**40 minutes** wall.
+
+**Scope decision** (user 2026-05-13): given the original 24-hour cap
+and the inequality-join speed wall, restrict order flow computation
+to the recent regime (Jan 2024 onward). Older bars get NaN for the
+5 order-flow columns; LightGBM handles NaN natively. HTF features
+computed for full range (cheap pandas).
+
+### 2. Implementation
+
+- `features/v2_builder.py` (new file, ~470 lines):
+  - `compute_orderflow_features(symbol, threshold, start_month, end_month)`:
+    psycopg COPY-streaming → numpy searchsorted aggregation.
+    Returns DataFrame [bar_id, taker_buy_vol, taker_sell_vol,
+    total_vol_ticks, max_trade_qty, n_ticks_in_bar].
+  - `compute_orderflow_derived(...)`: 5 derived features
+    (taker_buy_ratio, ema5, ema20, max_trade_share, trade_intensity).
+  - `compute_htf_v2(...)`: 3 HTF features (daily_ret_pct,
+    weekly_range_pos, regime_vol_ratio) via positional indexing
+    (handles 5 duplicate bar_close_ts values observed in 2019 hi-vol).
+  - CLI: `--start-month`, `--end-month`.
+- `scripts/run_phase_1_lgbm.py`: `--v2-features` flag wired through
+  `run()` and `run_joint_tb_threshold_sweep()`. Output naming:
+  `lgbm_results_v2.json`, `joint_tb03_threshold_sweep_v2.json`.
+- `scripts/ablation_v2.py` (new file): leave-one-out walk-forward
+  for 10 variants (baseline_33 / full_v2 / 8 leave-one-out).
+
+**Bugs found and fixed during implementation**:
+1. Initial COPY-streaming attributed 32M ticks to bar 17400 (true:
+   1.25M). Root cause: `np.datetime64(pd.Timestamp)` coerces to
+   `[us]` precision while `bar_close_arr.view('int64')` is in `[ns]`
+   → unit mismatch in filter `ts_ns > first_open_ns`. Fix: explicit
+   `.astype("datetime64[ns]")` before `.view("int64")`.
+2. HTF computation crashed on `reindex` with duplicate labels.
+   Five `bar_close_ts` collisions in 2019-06-26 (same nanosecond
+   tick triggered multiple bars in CUSUM construction). Fix: switch
+   from timestamp-indexed rolling to positional `searchsorted`-based
+   window computation.
+
+### 3. Result — joint sweep (TB=0.03 × threshold) on v2
+
+Wall clock: L0 walk-forward 1818s, joint sweep 2175s.
+
+Direct comparison vs DR v3.0.12 v1 baseline at **identical config**
+(TB=0.03, same 18 folds, default Lessmann 5%/5%/24 vertical labels):
+
+| thr | v1 Shp_all | v2 Shp_all | Δ | v1 trades | v2 trades |
+|---|---|---|---|---|---|
+| 0.45 | −0.088 | −0.084 | +0.00 | 1718 | 1701 |
+| 0.50 | −0.419 | −0.166 | +0.25 | 1541 | 1497 |
+| **0.55** | **+0.546** | +0.134 | **−0.41** | 869 | 887 |
+| 0.58 | +0.186 | **+0.558** | **+0.37** | 515 | 440 |
+| 0.60 | +0.251 | +0.106 | −0.15 | 351 | 268 |
+| **0.62** | **+0.657** | +0.375 | **−0.28** | 222 | 194 |
+| **0.65** | **+0.721** | +0.451 | **−0.27** | 104 | 115 |
+
+**Key finding**: v2 features do NOT improve over v1 baseline.
+- v1 best Sharpe(all) = **+0.721** (thr=0.65)
+- v2 best Sharpe(all) = **+0.558** (thr=0.58)
+- v2 best is **0.163 lower** than v1 best
+
+At v1's three strongest operating points (thr=0.55, 0.62, 0.65), v2
+regresses by 0.27–0.41. v2 only "wins" at thr=0.58 where v1 happened
+to be weak — but the absolute peak is still below v1's peak.
+
+### 4. L0 default (thr=0.60) result
+
+Aggregate Sharpe(all) **−0.7497 ± 2.91** — *worse* than baseline at
+default threshold. v2 trades more (268 vs baseline 351 at same config
+is actually less; but in the L0 default with TB=0.05 it trades more).
+Era 3 specifically:
+- Fold 15: 10 trades, Sharpe −3.38
+- Fold 16: 32 trades, Sharpe −0.77
+
+### 5. Ablation result (10-variant leave-one-out at TB=0.05/thr=0.60)
+
+Wall clock: 6h 42min. Results vs full_v2 (Shp_all = −0.750):
+
+| Variant | Shp_all | Δ vs full_v2 | Interpretation |
+|---|---|---|---|
+| baseline_33 (no v2 cols) | −0.091 | +0.66 | v2 features net-negative |
+| minus_taker_buy_ratio | −0.706 | +0.04 | OF feature: small hurt |
+| minus_taker_buy_ratio_ema5 | −0.667 | +0.08 | OF feature: small hurt |
+| minus_taker_buy_ratio_ema20 | −0.721 | +0.03 | OF feature: ~neutral |
+| minus_max_trade_share | −0.665 | +0.09 | OF feature: small hurt |
+| minus_trade_intensity | −0.815 | **−0.07** | OF feature: mildly helps |
+| **minus_daily_ret_pct** | **−0.451** | **+0.30** | HTF: STRONG hurt |
+| **minus_weekly_range_pos** | **−0.504** | **+0.25** | HTF: STRONG hurt |
+| **minus_regime_vol_ratio** | **−0.441** | **+0.31** | HTF: STRONG hurt |
+
+The three HTF features (daily_ret_pct, weekly_range_pos,
+regime_vol_ratio) each cost 0.25–0.31 Sharpe individually at the
+default config. Order flow features are individually near-neutral
+(except trade_intensity which is mildly beneficial). Combined HTF
+effect explains the bulk of the v2 regression at default config.
+
+**Why HTF hurts**: at default TB=0.05, the model uses HTF features
+to push borderline cases past the 0.60 confidence threshold. The
+extra trades have negative expected value because Lessmann's
+5%/5%/24 labels are noisy for HTF-driven signals. v2 helps slightly
+at TB=0.03/thr=0.58 because tighter labels make the HTF signal
+locally informative for some folds — but this doesn't beat v1 at
+v1's own best operating point.
+
+### 6. Decision tree applied (per spec)
+
+| Branch | Trigger | Hit? |
+|---|---|---|
+| Aggregate Sharpe ≥ 1.0 | info was the ceiling — ship v2 as new baseline | NO |
+| Aggregate Sharpe ∈ [0.5, 1.0) | info closed half the gap — proceed to L1 | technically YES, but |
+| Aggregate Sharpe < 0.5 | info not the dominant bottleneck — L1 first | **functionally HIT** |
+
+Both v1 (+0.721) and v2 (+0.558) clear the 0.5 absolute threshold,
+which would map to "info closed half the gap." But that branch was
+written assuming v2 would *exceed* v1. Empirically v2 < v1, so the
+information additions did NOT close any gap — they net-regressed.
+
+**Honest verdict**: information is **not** the dominant bottleneck.
+The 33-feature Lessmann set is approximately the right substrate for
+this labeling/cost configuration. Adding HTF context induces over-trading
+at standard thresholds; adding partial-history order flow is neutral.
+
+### 7. Next operational step
+
+**Proceed to L1 ResNet-LSTM (Test 2) on the 33-feature v1 baseline**
+(not v2). v2 doesn't add signal that LightGBM can use. The sequence
+model may still extract signal from the base 33 features that the
+tabular GBDT can't, or it may not — the model-ceiling test.
+
+If L1 lifts Sharpe(all) past 1.0 → ship and deploy.
+If L1 lifts to 0.7–1.0 → proceed to multimodal vision (Test 3,
+chart-image CNN concat with base features) per user's research interest.
+If L1 doesn't lift past 0.72 (v1 baseline) → bottleneck is labeling
+or costs, revisit those before adding more model complexity.
+
+The 5 order-flow features and `regime_vol_ratio` may still be useful
+for L1 (sequence models can exploit signal LightGBM ignores) — keep
+the v2 parquet around; revisit in L1 ablation.
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-12
+via deep-research strategic checkpoint with three-test sequence
+(information → model → multimodal vision), follow-the-evidence scope.
+
+**References**: Spec §7.2 (feature engineering), §16.4 (fallback
+ladder); DR v3.0.9 (L0 walk-forward baseline), DR v3.0.11/12 (TB
+sweep, joint sweep), DR v3.0.13 (Tier 1 features), DR v3.0.14
+(Path 3a ETH); user 2026-05-12 deep-research checkpoint.
+
+---
+
 ## 2026-05-11 — Decision v3.0.15 — TB sweep fill-in (0.035, 0.045) (DR)
 
 **Context**: DR v3.0.11 swept TB ∈ {0.03, 0.04, 0.05, 0.06, 0.07}
