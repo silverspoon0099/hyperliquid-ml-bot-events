@@ -5,6 +5,155 @@
 
 ---
 
+## 2026-05-14 — Decision v3.0.17 — L1 ResNet-LSTM (Test 2) (DR)
+
+**Context**: After DR v3.0.16 ruled out information as the bottleneck
+(v2 features regressed at v1's best operating points), the deep-research
+sequence dictates Test 2: the **model ceiling test**. Hypothesis: a
+sequence model can extract signal LightGBM's tabular GBDT cannot.
+
+**Scope**: Mini-Hyperband — 5 hand-picked configs × 18 walk-forward
+folds × single seed × 33-feature v1 baseline. CPU-only (no GPU).
+PyTorch CPU framework (newly installed). 96-bar sequence input,
+3-class softmax output, Adam + cross-entropy, early stopping on
+val_logloss with patience 5.
+
+### 1. Implementation
+
+- `pip install torch --index-url https://download.pytorch.org/whl/cpu`
+  → torch 2.12.0+cpu, 32 threads
+- `model/resnet_lstm.py` (new): PyTorch nn.Module
+  - `ResBlock1D`: Conv1d→BN→ReLU→Dropout→Conv1d→BN→skip→ReLU
+  - `ResNetLSTM`: input_proj (33→C) → ResBlock → LSTM → last hidden
+    → Dropout → Linear(3)
+  - `L1_CONFIGS`: 5 named configs (A_small, B_medium, C_large,
+    D_deep, E_wide_batch)
+  - `build_sequences`: 96-bar window assembly with NaN-skip
+  - `train_resnet_lstm`: Adam, cross-entropy, early stopping
+  - `predict_proba`: softmax forward pass
+- `scripts/run_phase_1_resnet_lstm.py` (new): walk-forward orchestrator
+  mirroring `run_phase_1_lgbm.py` structure
+  - StandardScaler-equivalent on train-only stats; applied to val/oot
+  - Sequences built per-bar with full historical lookback
+  - Same Platt calibration on val_proba → OOT_proba
+  - Same `simulate_trades` + `compute_metrics` backtest
+  - `--threshold-sweep` flag: backtest at multiple thresholds, no retrain
+  - `--tb` flag: in-memory relabel for apples-to-apples vs L0 joint sweep
+
+### 2. Mini-Hyperband result (TB=0.05 default labels, thr=0.60)
+
+5 configs × 18 folds, total wall clock 2h 21min:
+
+| Config | Wall | Sharpe(all) | active folds | trades_mean | win% |
+|---|---|---|---|---|---|
+| A_small (32ch/64h/1L) | 10 min | +0.081 | 2 | 3.9 | 6.3 |
+| **B_medium (64ch/128h/1L)** | **18 min** | **+0.115** | **3** | **4.0** | **9.1** |
+| C_large (128ch/256h/2L) | 62 min | +0.114 | 3 | 4.4 | 8.9 |
+| D_deep (64ch/128h/2L,k=7) | 30 min | −0.061 | 3 | 4.4 | 8.0 |
+| E_wide_batch (128ch/128h/B=128) | 20 min | −0.545 | (high var) | 5.2 | 11.4 |
+
+B_medium is best. D_deep and E_wide_batch *regress* below A_small.
+Convergence happens fast (6-10 epochs typically before early stopping
+triggers — patience 5 on val_logloss). Pre-gate (ratio < 0.99) passes
+5-6/6 across configs.
+
+### 3. L1 threshold sweep at TB=0.05 (B_medium, no retrain)
+
+| thr | n_trd | active | win% | Sharpe(all) | Sharpe(!=0) |
+|---|---|---|---|---|---|
+| 0.50 | 340 | 13/18 | 54.1 | −0.161 | −0.242 |
+| 0.55 | 161 | 8/18 | 51.6 | −0.218 | −0.491 |
+| 0.58 | 86 | 4/18 | 46.9 | −0.054 | −0.245 |
+| 0.60 | 72 | 3/18 | 54.4 | +0.115 | +0.691 |
+| 0.62 | 70 | 2/18 | 56.6 | +0.081 | +0.732 |
+| **0.65** | 28 | 2/18 | **60.4** | **+0.242** | **+2.178** |
+
+### 4. L1 vs L0 fair comparison at TB=0.03 (B_medium retrained)
+
+To match DR v3.0.12's best L0 operating point, re-ran B_medium with
+in-memory TB=0.03 relabel. Side-by-side Sharpe(all):
+
+| thr | L0 baseline (v3.0.12) | L1 B_medium (this DR) | Δ (L1 − L0) |
+|---|---|---|---|
+| 0.45 | −0.088 | (untested) | — |
+| 0.50 | −0.419 | −0.933 | −0.51 |
+| **0.55** | **+0.546** | +0.207 | **−0.34** |
+| 0.58 | +0.186 | +0.229 | +0.04 |
+| 0.60 | +0.251 | −0.030 | −0.28 |
+| **0.62** | **+0.657** | +0.316 | **−0.34** |
+| **0.65** | **+0.721** | +0.135 | **−0.59** |
+
+**L0 best Sharpe(all) = +0.721** (thr=0.65)
+**L1 best Sharpe(all) = +0.316** (thr=0.62)
+
+**L1 is 0.40 Sharpe BELOW L0 at the same TB=0.03 labels.** At thr=0.65
+specifically (L0's strongest point), L1 loses 0.59. The sequence model
+does NOT extract more signal than the tabular GBDT — in fact it
+extracts less. Possible reasons: (a) CPU training caps the optimization;
+(b) the 96-bar lookback adds noise rather than signal; (c) batch
+normalization on per-fold StandardScaler is misaligned with non-stationary
+distribution; (d) the underlying signal in the 33 features is
+saturated by LightGBM's split-finding.
+
+### 5. Decision tree applied (per DR scoping)
+
+| Best L1 Sharpe(all) | Action |
+|---|---|
+| ≥ 1.0 | §16.1 gate cleared, ship L1 — NO |
+| ≥ 0.85 | proceed to Test 3 multimodal vision — NO |
+| ∈ [0.72, 0.85] | proceed to Test 3 vision — NO |
+| **< 0.72** | bottleneck is labeling or costs, not model — **HIT** |
+
+**Verdict: model is NOT the bottleneck.**
+
+### 6. Implications for next operational step
+
+The deep-research three-test sequence (information → model → vision)
+is now functionally exhausted with two definitive negatives:
+- DR v3.0.16: information is not the ceiling (v2 features net-regressed)
+- DR v3.0.17: model is not the ceiling (ResNet-LSTM underperforms LGBM)
+
+**This argues against Test 3 (multimodal vision)** as currently spec'd.
+Vision adds another representation but the same labels and costs apply.
+If two model families fail with the same labels, the bottleneck is
+upstream of representation.
+
+**Recommended next moves** (in priority order):
+1. **Labeling**: meta-labeling (Lopez de Prado §3.6): primary model
+   predicts direction, secondary model (binary) decides *whether to
+   trade*. Increases precision at cost of recall.
+2. **Continuous targets**: regress on forward log-return at multiple
+   horizons (6h, 12h, 24h) instead of categorical 3-class.
+3. **Cost structure**: revisit the 11 bps round-trip assumption with
+   Hyperliquid taker tiers + dynamic slippage modeling.
+4. **Bar definition**: try CUSUM at multiple thresholds (0.01, 0.015)
+   instead of fixed 2% — finer-grained event bars may give label
+   variety.
+
+Multimodal vision is deferred — same labels would apply, same
+underlying signal limit, same ~0.7 ceiling regardless of model.
+
+### 7. Cost & artifacts
+
+- Total compute: ~2h 30min CPU (L1 mini-Hyperband + 2 threshold sweeps)
+- New files: `model/resnet_lstm.py`, `scripts/run_phase_1_resnet_lstm.py`
+- 7 result JSONs in `reports/phase_1/`: 5 mini-Hyperband + 1 thr-sweep
+  + 1 TB=0.03 retrain. Aggregate Sharpe across all configs ranged
+  −0.545 to +0.316, all below the L0 baseline ceiling.
+
+**Pytest 64/64 still green**.
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-13 with
+"GO approved as scoped" on DR v3.0.17 candidate (5 configs, CPU mini-
+Hyperband, 3-day hard cap).
+
+**References**: Spec §5.2 (model architecture), §16.4 (fallback ladder);
+DR v3.0.9 (L0 baseline), DR v3.0.12 (joint sweep best operating point),
+DR v3.0.16 (v2 features negative); Lessmann §"Architecture";
+Lopez de Prado AFML §3.6 (meta-labeling, for next step).
+
+---
+
 ## 2026-05-13 — Decision v3.0.16 — v2 information features (order flow + HTF) (DR)
 
 **Context**: After DRs v3.0.9–v3.0.15 hit a ~0.25 aggregate Sharpe
