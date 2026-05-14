@@ -5,6 +5,122 @@
 
 ---
 
+## 2026-05-14 — Decision v3.0.19 — L0 meta-labeling (Step 1) (DR)
+
+**Context**: After DR v3.0.18 confirmed cost is not the bottleneck,
+proceed to Step 1 of the upstream sequence 3→1→4→2. Anchor: Lopez de
+Prado AFML §3.6. Hypothesis: a binary "trade-or-skip" secondary model
+on top of L0's primary 3-class predictions can lift Sharpe by filtering
+false positives.
+
+**Standing instruction**: track both thr=0.62 AND thr=0.65 in every
+reported row.
+
+### 1. Implementation
+
+- `scripts/extract_l0_predictions.py` (new): trains L0 per fold at
+  TB=0.03, simulates trades at each primary threshold, persists per-
+  signal records to parquet (`reports/phase_1/l0_predictions_thr{N}.parquet`).
+  Fields: bar_id, fold_id, primary_thr, primary probas, direction,
+  entry/exit ts + price, exit_reason, holding_bars, pnl_bps_gross/net,
+  win indicator, true_label.
+- `scripts/run_meta_labeling.py` (new):
+  - Out-of-fold stacking: for outer fold f ≥ MIN_TRAIN_FOLDS, train
+    secondary LightGBM on primary OOT signals from folds [1..f-1],
+    predict on fold f. Folds < MIN_TRAIN_FOLDS use primary alone
+    (cold-start, meta_proba = 1.0).
+  - Secondary inputs: [p_long, p_short, p_neutral, direction, 33 base features] = 37 features
+  - Secondary target: `win = (pnl_bps_net > 0)`
+  - Secondary model: smaller LGBM (15 leaves, 500 rounds, early stop on val_logloss)
+  - Sweep meta-threshold ∈ {0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.65, 0.70}
+  - Aggregate Sharpe uses **N_EVALUATED_FOLDS=18** denominator (matches L0 joint
+    sweep convention for direct comparability to baseline +0.721/+0.657).
+
+### 2. Two-stage testing
+
+**First test (primary thresholds 0.62 + 0.65)**: only 222 / 104 primary
+signals across 8 / 4 folds. With MIN_TRAIN_FOLDS=4, the cold-start
+period (folds 1-3) dominated — secondary trained on only 1 fold of
+data at thr=0.65 (just 3 test signals). **Meta-labeling had nothing
+to filter at high primary thresholds**, producing 0 lift everywhere.
+
+**Second test (primary thresholds 0.50 + 0.55)**: 1541 / 869 signals
+across 17 / 14 folds. Secondary trained on 100-800 prior signals per
+fold — enough to learn filtering.
+
+### 3. Result table (corrected Sharpe(all 18 folds) basis)
+
+Direct comparison to **L0 baseline (joint sweep best, DR v3.0.12)**:
+
+| Operating point | Sharpe(all) | Sharpe(!=0) | n_trades | active | win% | mPnL |
+|---|---|---|---|---|---|---|
+| **L0 thr=0.65 (champion)** | **+0.721** | +3.246 | 104 | 4/18 | 84.6 | +237 |
+| **L0 thr=0.62** | **+0.657** | +1.477 | 222 | 8/18 | 73.4 | +149 |
+| L0 thr=0.55 | +0.546 | +0.701 | 869 | 14/18 | 56.4 | +34 |
+| L0 thr=0.50 | −0.419 | −0.443 | 1541 | 17/18 | 53.2 | +11 |
+| meta: prim 0.55 + meta 0.55 | **+0.653** | +0.840 | 793 | 14/18 | 57.0 | +40 |
+| meta: prim 0.55 + meta 0.65 | +0.324 | +0.971 | 487 | 6/18 | 60.8 | +64 |
+| meta: prim 0.50 + meta 0.65 | +0.150 | +0.900 | 636 | 5/18 | 57.7 | +43 |
+| meta: prim 0.62 + meta 0.70 | +0.627 | +1.611 | 207 | 7/18 | 74.9 | +159 |
+| meta: prim 0.65 (any meta) | +0.721 | +3.246 | 104 | 4/18 | 84.6 | +237 |
+
+**Best absolute Sharpe with meta**: +0.653 (prim 0.55 + meta 0.55). Still
+below L0 baseline thr=0.65 +0.721 by 0.07.
+
+**Best lift OVER its own primary baseline**: prim 0.50 + meta 0.65/0.70
+lifts from −0.419 to +0.150 (Δ +0.569) — but absolute Sharpe is still
+worse than L0 baseline thr=0.65.
+
+### 4. Decision tree applied
+
+| Branch | Trigger | Hit? |
+|---|---|---|
+| Best meta lift over L0 baseline ≥ +0.28 (clears 1.0) | ship — NO |
+| ≥ +0.10 over L0 baseline | proceed to Step 4 on this stack — NO |
+| < +0.10 over L0 baseline | meta doesn't help; proceed to Step 4 | **HIT** |
+
+**Honest verdict**: Meta-labeling **does not lift above L0 baseline**.
+The threshold-tuning we already have (joint sweep across confidence
+thresholds) is doing the same job — selecting the highest-precision
+subset of the primary's signals. The secondary model can't find an
+additional filter dimension beyond raw probability magnitude.
+
+### 5. Two interpretations of the null result
+
+**(a) Signal-extraction interpretation**: L0's confidence is already a
+sufficient statistic for "will this trade win?". The 33 base features
+contain the discriminative information; LightGBM extracts it once;
+the secondary has nothing to add. This is consistent with DR v3.0.16
+(adding features didn't help) and DR v3.0.17 (sequence model didn't
+help). The signal is saturated.
+
+**(b) Deployability interpretation**: At prim 0.55 + meta 0.55, we get
++0.653 Sharpe across 793 trades / 14 active folds — vs L0 baseline
+thr=0.65 +0.721 across 104 trades / 4 active folds. **Similar Sharpe,
+7-8× more trades, 3.5× more active folds.** For a live deployment
+where trade volume and consistency across regimes matter, this is a
+real improvement even if it doesn't clear §16.1. Worth noting for
+deployment selection, but doesn't change the verdict on §16.1.
+
+### 6. Next operational step
+
+**Proceed to Step 4: bar definition (DR v3.0.20 candidate)**. Per the
+user's 3→1→4→2 sequence. Test CUSUM at finer thresholds (1%, 1.5%)
+vs current 2% to see if a different bar granularity unlocks the §16.1
+gate. Larger candidate set per unit time may give the model more
+options to find sustained moves.
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-14 with
+"GO — expand meta-threshold sweep" on DR v3.0.19 candidate. Pivoted
+mid-run to lower primary thresholds (0.50/0.55) after initial test at
+0.62/0.65 had insufficient signals for secondary training.
+
+**References**: Spec §16.4 (fallback ladder); DR v3.0.9 (L0 baseline),
+DR v3.0.12 (joint sweep best operating points), DR v3.0.18 (cost not
+the ceiling); Lopez de Prado AFML §3.6 (meta-labeling primary).
+
+---
+
 ## 2026-05-14 — Decision v3.0.18 — L0 cost-structure revisit (Step 3) (DR)
 
 **Context**: After DRs v3.0.16/17 ruled out information and model as
