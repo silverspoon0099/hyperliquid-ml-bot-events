@@ -150,8 +150,31 @@ backtest:
   position_size_usd:     10000
   leverage:              1
   funding_modeled:       false   # Phase A; mandatory in Phase C
-  costs_bps_per_side:    5.5     # 3.5 taker + 2 slippage
-  costs_bps_round_trip:  11.0    # FROZEN per spec §10.1
+  costs_bps_per_side:    5.5     # 3.5 taker + 2 slippage  (legacy default — DR v3.0.18 cost-sweep overrides)
+  costs_bps_round_trip:  11.0    # FROZEN spec §10.1        (legacy default — DR v3.0.18 cost-sweep overrides)
+
+# ────────────────────────────────────────────────────────────────────
+# Cost model — Hyperliquid taker fee structure (DR v3.0.18 step C)
+# Used by --cost-sweep on run_phase_1_lgbm. Realistic scenarios for
+# the §16.1 1.0 Sharpe gate at the intended deployment venue.
+# ────────────────────────────────────────────────────────────────────
+costs:
+  hyperliquid:
+    # Per-side taker bps (no funding, no maker rebate — L0 is taker-only):
+    base_taker_bps_per_side:    4.5    # No tier, no HYPE stake
+    tier1_taker_bps_per_side:   4.0    # $5M-25M 14d volume
+    tier_top_taker_bps_per_side: 2.4   # $25M+ + HYPE stake
+  slippage_bps_per_side:
+    tight_market:    0.5    # Major hours, deep book
+    typical:         2.0    # Current Phase A assumption
+    illiquid:        5.0    # Off-hours / vol spike
+  # Round-trip scenarios swept in DR v3.0.18 (both sides combined):
+  scenarios:
+    optimistic:           5.0    # 2.4 taker + 0.1 slip per side × 2
+    realistic:            7.0    # 2.4 taker + 1.1 slip per side × 2  (tier_top, light slip)
+    baseline_hyperliquid: 9.0    # 4.0 taker + 0.5 slip per side × 2  (tier1, tight)
+    current_default:     11.0    # FROZEN spec §10.1 (Binance proxy)
+    conservative:        15.0    # 4.5 taker + 3.0 slip per side × 2  (worst-case)
 
 # ────────────────────────────────────────────────────────────────────
 # Risk (§13)

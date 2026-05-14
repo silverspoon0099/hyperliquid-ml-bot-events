@@ -1113,6 +1113,218 @@ def print_joint_sweep_report(out: dict) -> None:
     print("  per 3-month window). Mean across folds is the meaningful aggregate.")
 
 
+def run_cost_threshold_sweep(
+    first_n: Optional[int] = None,
+    tb: float = 0.03,
+    thresholds: tuple = (0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65),
+    costs_bps_round_trip_list: tuple = (5.0, 7.0, 9.0, 11.0, 15.0),
+    asset: str = "BTC",
+) -> dict:
+    """DR v3.0.18 step A: cost × threshold sensitivity at fixed TB=0.03.
+
+    Trains once per fold (TB=0.03, default LGBM params), backtests at every
+    (threshold × cost_bps_round_trip) combination. Output structure:
+        by_threshold[thr_str]["by_cost"][cost_str] = aggregate dict
+    """
+    from labels.triple_barrier import apply_triple_barrier
+
+    cfg = _load_config()
+    wf = cfg["walk_forward"]
+    lgbm_params = cfg["model"]["L0_lightgbm"]
+    vertical_bars = cfg["labeling"]["vertical_bars"]
+
+    LOG.info("loading features + bars (asset=%s, with OHLC)...", asset)
+    feats = _load_features(asset=asset)
+    bars_full = _load_bars_ohlc(asset=asset)
+    feature_cols = [c for c in feats.columns if c not in KEY_COLS]
+
+    LOG.info("relabeling at TB=tp=sl=%.3f...", tb)
+    labels_df = apply_triple_barrier(
+        bars_full[["bar_id", "bar_open_ts", "bar_close_ts", "close", "high", "low"]],
+        tp_pct=tb, sl_pct=tb, vertical_bars=vertical_bars,
+    )
+    df_full = feats.merge(labels_df, on="bar_id", how="inner")
+    df_full = df_full[df_full[LABEL_COL] != -1].copy()
+    df_full["label"] = df_full["label"].astype("int64")
+    df_full = df_full.sort_values(["bar_close_ts", "bar_id"]).reset_index(drop=True)
+    LOG.info("relabel done: %d labelable bars", len(df_full))
+
+    data_start = date(df_full["bar_close_ts"].min().year,
+                      df_full["bar_close_ts"].min().month, 1)
+    data_end_ts = df_full["bar_close_ts"].max()
+    if data_end_ts.month == 12:
+        data_end = date(data_end_ts.year + 1, 1, 1)
+    else:
+        data_end = date(data_end_ts.year, data_end_ts.month + 1, 1)
+
+    folds = generate_folds(
+        data_start=data_start, data_end=data_end,
+        initial_train_months=wf["initial_train_months"],
+        val_months=wf["val_months"], oot_months=wf["oot_months"],
+        step_months=wf["step_months"],
+    )
+    if first_n is not None:
+        folds = folds[:first_n]
+    LOG.info("folds=%d  thresholds=%s  costs=%s",
+             len(folds), list(thresholds), list(costs_bps_round_trip_list))
+
+    # by_threshold[thr_str][cost_str] -> list of per-fold rows
+    by_tc: dict[str, dict[str, list]] = {
+        f"{thr:.2f}": {f"{c:.1f}": [] for c in costs_bps_round_trip_list}
+        for thr in thresholds
+    }
+
+    t0_total = time.perf_counter()
+    n_evaluated = 0
+
+    for fold in folds:
+        parts = split_fold(df_full, fold, purge_bars=wf["purge_bars"],
+                            embargo_bars=wf["embargo_bars"], ts_col="bar_close_ts")
+        train, val, oot = parts["train"], parts["val"], parts["oot"]
+        if len(val) < 100 or len(oot) < 100:
+            LOG.warning("Fold %d: SKIPPED (n_val=%d or n_oot=%d < 100)",
+                        fold.fold_id, len(val), len(oot))
+            continue
+        n_evaluated += 1
+
+        booster = train_lgbm(
+            train[feature_cols], train[LABEL_COL].astype(int).values,
+            val[feature_cols], val[LABEL_COL].astype(int).values,
+            dict(lgbm_params),
+        )
+        val_raw = booster.predict(val[feature_cols])
+        cal = fit_platt(val_raw, val[LABEL_COL].astype(int).values, n_classes=3)
+        oot_raw = booster.predict(oot[feature_cols])
+        oot_cal = apply_platt(oot_raw, cal)
+
+        preds = pd.DataFrame({
+            "bar_id": oot["bar_id"].astype("int64").values,
+            "p_long":   oot_cal[:, 0],
+            "p_short":  oot_cal[:, 1],
+            "p_neutral": oot_cal[:, 2],
+        })
+        labels_oot = oot[["bar_id", "exit_bar_id", "exit_price",
+                          "exit_reason", "holding_bars", "label"]].copy()
+
+        for thr in thresholds:
+            for cost in costs_bps_round_trip_list:
+                trades = simulate_trades(
+                    predictions=preds,
+                    bars_df=bars_full[["bar_id", "bar_close_ts", "close"]],
+                    labels_df=labels_oot,
+                    confidence_threshold=thr,
+                    cost_bps_round_trip=cost,
+                    max_concurrent=1,
+                )
+                eq = build_equity_curve(trades, starting_equity=10_000.0)
+                metrics = compute_metrics(trades, eq, oot_n_bars=len(oot))
+                mean_pnl = float(np.mean([t.pnl_bps_net for t in trades])) if trades else 0.0
+                by_tc[f"{thr:.2f}"][f"{cost:.1f}"].append({
+                    "fold": fold.fold_id,
+                    "n_oot": len(oot),
+                    "n_trades": metrics["oot_n_trades"],
+                    "mean_pnl_bps_net": mean_pnl,
+                    "win_pct": metrics["oot_profitable_trade_pct"],
+                    "sharpe": metrics["oot_sharpe"],
+                    "annual_return": metrics["oot_annual_return"],
+                })
+        LOG.info("Fold %d: trained; backtested %d×%d=%d combos",
+                 fold.fold_id, len(thresholds), len(costs_bps_round_trip_list),
+                 len(thresholds) * len(costs_bps_round_trip_list))
+
+    total_s = time.perf_counter() - t0_total
+
+    # Aggregate per (thr, cost) combo
+    results: dict = {}
+    for thr_str, by_cost in by_tc.items():
+        results[thr_str] = {}
+        for cost_str, fold_rows in by_cost.items():
+            if not fold_rows:
+                results[thr_str][cost_str] = {"aggregate": {}, "per_fold": []}
+                continue
+            sharpes = [r["sharpe"] for r in fold_rows]
+            nz = [s for s in sharpes if s != 0.0]
+            any_trade = [r for r in fold_rows if r["n_trades"] > 0]
+            n_total = sum(r["n_trades"] for r in fold_rows)
+            results[thr_str][cost_str] = {
+                "aggregate": {
+                    "n_trades_total": n_total,
+                    "n_active_folds": len(any_trade),
+                    "n_folds_zero_trades": sum(1 for r in fold_rows if r["n_trades"] == 0),
+                    "mean_pnl_bps_net": float(np.mean([r["mean_pnl_bps_net"] for r in any_trade])) if any_trade else 0.0,
+                    "win_pct_mean": float(np.mean([r["win_pct"] for r in any_trade])) if any_trade else 0.0,
+                    "sharpe_mean_across_folds": float(np.mean(sharpes)),
+                    "sharpe_mean_nonzero_folds": float(np.mean(nz)) if nz else 0.0,
+                    "annual_return_mean": float(np.mean([r["annual_return"] for r in fold_rows])),
+                },
+                "per_fold": fold_rows,
+            }
+
+    out = {
+        "tb": tb,
+        "thresholds_swept": list(thresholds),
+        "costs_swept": list(costs_bps_round_trip_list),
+        "n_folds_total": len(folds),
+        "n_folds_evaluated": n_evaluated,
+        "wall_clock_seconds": total_s,
+        "asset": asset,
+        "by_threshold": results,
+    }
+    from data.db import symbol_short
+    sym = symbol_short(asset)
+    asset_suffix = "" if sym == "btc" else f"_{sym}"
+    out_path = PROJECT_ROOT / "reports" / "phase_1" / f"cost_sensitivity_joint{asset_suffix}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(out, indent=2, default=str))
+    LOG.info("wrote %s", out_path)
+    return out
+
+
+def print_cost_sweep_report(out: dict) -> None:
+    print(f"\n========== L0 Cost × Threshold Sweep (DR v3.0.18) ==========")
+    print(f"Folds total / evaluated: {out['n_folds_total']} / {out['n_folds_evaluated']}")
+    print(f"Wall clock: {out['wall_clock_seconds']:.1f}s")
+    print(f"TB fixed at: {out['tb']}")
+    print(f"Thresholds: {out['thresholds_swept']}")
+    print(f"Costs (bps RT): {out['costs_swept']}\n")
+
+    # Pivot: Sharpe_all at every (thr, cost) combo
+    print("--- Sharpe(all 18 folds) by (threshold × cost) ---")
+    header = f"  {'thr':>5} " + "".join(f" {f'{c:.1f}bps':>10}" for c in out["costs_swept"])
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for thr in out["thresholds_swept"]:
+        row = f"  {thr:>5.2f} "
+        for cost in out["costs_swept"]:
+            a = out["by_threshold"][f"{thr:.2f}"][f"{cost:.1f}"]["aggregate"]
+            row += f" {a.get('sharpe_mean_across_folds', 0):>+10.3f}"
+        print(row)
+    print()
+    print("--- Sharpe(active folds only) by (threshold × cost) ---")
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    for thr in out["thresholds_swept"]:
+        row = f"  {thr:>5.2f} "
+        for cost in out["costs_swept"]:
+            a = out["by_threshold"][f"{thr:.2f}"][f"{cost:.1f}"]["aggregate"]
+            row += f" {a.get('sharpe_mean_nonzero_folds', 0):>+10.3f}"
+        print(row)
+
+    # Focus row: thr=0.62 and thr=0.65 (per user standing instruction)
+    print("\n--- Headline operating points (thr=0.62, thr=0.65) ---")
+    print(f"  {'config':<26}  {'cost_bps':>8}  {'n_trd':>6}  {'win%':>6}  {'mPnL':>9}  {'Shp_all':>8}  {'Shp_!=0':>8}")
+    for thr in (0.62, 0.65):
+        if f"{thr:.2f}" not in out["by_threshold"]:
+            continue
+        for cost in out["costs_swept"]:
+            a = out["by_threshold"][f"{thr:.2f}"][f"{cost:.1f}"]["aggregate"]
+            label = f"TB=0.03 × thr={thr:.2f}"
+            print(f"  {label:<26}  {cost:>8.1f}  {a.get('n_trades_total', 0):>6}  "
+                  f"{a.get('win_pct_mean', 0):>6.1f}  {a.get('mean_pnl_bps_net', 0):>+9.1f}  "
+                  f"{a.get('sharpe_mean_across_folds', 0):>+8.3f}  "
+                  f"{a.get('sharpe_mean_nonzero_folds', 0):>+8.3f}")
+
+
 def main(argv: list[str]) -> int:
     p = argparse.ArgumentParser(prog="run_phase_1_lgbm")
     p.add_argument("--first-n", type=int, default=None,
@@ -1134,6 +1346,9 @@ def main(argv: list[str]) -> int:
     p.add_argument("--joint-sweep", action="store_true",
                    help="DR v3.0.12: TB=0.03 × threshold sweep "
                         "across {0.45, 0.50, 0.55, 0.58, 0.60, 0.62, 0.65}.")
+    p.add_argument("--cost-sweep", action="store_true",
+                   help="DR v3.0.18: TB=0.03 × threshold × cost sweep "
+                        "across costs {5, 7, 9, 11, 15} bps RT.")
     p.add_argument("--tier1-features", action="store_true",
                    help="DR v3.0.13: read features_{sym}_tier1.parquet "
                         "(48 features) instead of features_{sym}.parquet "
@@ -1160,6 +1375,9 @@ def main(argv: list[str]) -> int:
                 v2=args.v2_features, asset=asset,
             )
             print_joint_sweep_report(out)
+        elif args.cost_sweep:
+            out = run_cost_threshold_sweep(first_n=args.first_n, asset=asset)
+            print_cost_sweep_report(out)
         elif args.tb_sweep:
             tb_kwargs: dict = {"first_n": args.first_n, "asset": asset,
                                "out_name": args.tb_out_name}

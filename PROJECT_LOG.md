@@ -5,6 +5,132 @@
 
 ---
 
+## 2026-05-14 — Decision v3.0.18 — L0 cost-structure revisit (Step 3) (DR)
+
+**Context**: After DRs v3.0.16/17 ruled out information and model as
+the bottleneck, user authorized the upstream sequence 3→1→4→2:
+cost-structure first (cheap), then meta-labeling, then bar
+definition, then continuous targets. Standing instruction: track
+**both thr=0.62 AND thr=0.65** in every result.
+
+**Hypothesis**: The 11 bps round-trip baseline (Binance proxy + 2 bps
+slip per side) is conservative for Hyperliquid taker deployment.
+Hyperliquid base taker is 4.5 bps × 2 sides = 9 bps; with volume tier
++ HYPE stake it can drop to 2.4 bps × 2 = ~5 bps round-trip plus
+slippage. Question: does using realistic Hyperliquid costs lift Sharpe
+materially?
+
+### 1. Scope (per user GO 2026-05-14)
+
+- **A. Cost sensitivity sweep**: 5 round-trip cost levels × 7
+  thresholds × 18 walk-forward folds, TB=0.03 fixed. Re-uses joint
+  sweep training (one train per fold) and runs 35 backtest combos
+  per fold (5 costs × 7 thresholds).
+- **C. Hyperliquid fee structure in config**: documents the realistic
+  taker fee schedule + slippage scenarios in `config.yaml costs:`
+  block for traceability.
+- **B (dynamic slippage)**: SKIPPED per user direction — $10k position
+  is small relative to typical BTC bar volume, proportional slippage
+  is a marginal refinement.
+
+### 2. Implementation
+
+- `config.yaml`: new `costs:` block documenting Hyperliquid taker tiers
+  (base 4.5 / tier1 4.0 / tier_top 2.4 bps per side), slippage
+  scenarios (tight 0.5 / typical 2.0 / illiquid 5.0 bps per side),
+  and the 5 round-trip scenarios tested in step A.
+- `scripts/run_phase_1_lgbm.py`: new `run_cost_threshold_sweep`
+  function + `--cost-sweep` CLI flag. Per fold, trains LightGBM at
+  TB=0.03 once and computes metrics for every (threshold × cost)
+  combo. Output: `reports/phase_1/cost_sensitivity_joint.json`.
+
+### 3. Result (full 18-fold cost × threshold sweep)
+
+Wall clock: 49 minutes. Sharpe(all 18 folds) pivot table:
+
+| thr | 5.0 bps | 7.0 bps | 9.0 bps | **11.0 bps** | 15.0 bps |
+|---|---|---|---|---|---|
+| 0.45 | +0.157 | +0.075 | −0.007 | −0.088 | −0.252 |
+| 0.50 | −0.189 | −0.266 | −0.342 | −0.419 | −0.572 |
+| 0.55 | +0.675 | +0.632 | +0.589 | +0.546 | +0.459 |
+| 0.58 | +0.266 | +0.239 | +0.213 | +0.186 | +0.132 |
+| 0.60 | +0.318 | +0.296 | +0.273 | +0.251 | +0.206 |
+| **0.62** | **+0.702** | +0.687 | +0.672 | +0.657 | +0.627 |
+| **0.65** | **+0.724** | +0.723 | +0.722 | +0.721 | +0.719 |
+
+**Headline (thr=0.62 + thr=0.65, all 5 cost scenarios)**:
+
+| Operating point | cost bps RT | n_trades | win% | mPnL bps | Sharpe(all) | Sharpe(!=0) |
+|---|---|---|---|---|---|---|
+| TB=0.03 × thr=0.62 | 5.0 (best) | 222 | 68.1 | +90.2 | **+0.702** | +1.578 |
+| TB=0.03 × thr=0.62 | 7.0 (realistic) | 222 | 68.1 | +88.2 | +0.687 | +1.545 |
+| TB=0.03 × thr=0.62 | 9.0 (HL base) | 222 | 67.9 | +86.2 | +0.672 | +1.511 |
+| TB=0.03 × thr=0.62 | 11.0 (current) | 222 | 67.9 | +84.2 | +0.657 | +1.477 |
+| TB=0.03 × thr=0.62 | 15.0 (conservative) | 222 | 67.9 | +80.2 | +0.627 | +1.410 |
+| TB=0.03 × thr=0.65 | 5.0 (best) | 104 | 81.8 | +183.7 | **+0.724** | +3.260 |
+| TB=0.03 × thr=0.65 | 7.0 (realistic) | 104 | 81.8 | +181.7 | +0.723 | +3.255 |
+| TB=0.03 × thr=0.65 | 9.0 (HL base) | 104 | 81.0 | +179.7 | +0.722 | +3.251 |
+| TB=0.03 × thr=0.65 | 11.0 (current) | 104 | 81.0 | +177.7 | +0.721 | +3.246 |
+| TB=0.03 × thr=0.65 | 15.0 (conservative) | 104 | 81.0 | +173.7 | +0.719 | +3.237 |
+
+### 4. Cost-elasticity analysis
+
+**Δ Sharpe(all) per 6 bps RT cost reduction (11 → 5 bps)**:
+- thr=0.45: Δ = +0.245 (highly sensitive — 1700+ trades, low win%)
+- thr=0.50: Δ = +0.230
+- thr=0.55: Δ = +0.129
+- thr=0.58: Δ = +0.080
+- thr=0.60: Δ = +0.067
+- **thr=0.62: Δ = +0.045**
+- **thr=0.65: Δ = +0.003** (insensitive — high mPnL, low trade count)
+
+The cost-elasticity follows trade frequency × inverse-mPnL: high-precision
+configs (thr=0.65 with +178 bps mPnL) absorb cost reductions without
+much Sharpe lift because there are few trades and each trade's
+mPnL >> cost. Low-precision configs (thr=0.45 with +14 bps mPnL) are
+highly cost-sensitive.
+
+### 5. Decision tree applied
+
+| Best Sharpe(all) at 7 bps RT | Action |
+|---|---|
+| ≥ 1.0 | §16.1 cleared — ship — NO (+0.723) |
+| ≥ 0.85 | strong — meta-labeling next on this baseline — NO |
+| ≥ 0.72 | marginal — proceed to meta-labeling on this baseline — **TECHNICALLY HIT** (+0.723 at thr=0.65, +0.687 at thr=0.62) |
+| < 0.72 | skip B/C, proceed directly to meta-labeling — close but cleared |
+
+**Honest verdict**: Cost is **not** the bottleneck. The realistic
+Hyperliquid cost (7 bps RT) gives **+0.723 / +0.687** at our two
+champion thresholds — essentially identical to the 11 bps baseline
+(+0.721 / +0.657). The model's per-trade edge is so large at high
+confidence that cost reduction is negligible.
+
+**Two implications**:
+1. **Sharpe estimates are robust to cost assumptions** (deployment
+   confidence: HIGH). We can ship with conservative cost modeling.
+2. **Cost optimization will not unlock the §16.1 gate** (need to look
+   elsewhere — labeling is next).
+
+### 6. Next operational step
+
+**Proceed to Step 1: meta-labeling (DR v3.0.19 candidate)** per user's
+3→1→4→2 sequence. The L0 base model is mature; layer a binary
+"trade-or-skip" secondary model on top of its primary 3-class
+predictions to raise precision (win%) at cost of recall (trade count).
+Operating points to test: thr=0.62 (222 trades, 68% win) and thr=0.65
+(104 trades, 81% win).
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-14 with
+"GO A and C only (skip dynamic slippage)" on DR v3.0.18 candidate.
+
+**References**: Spec §11 (backtesting), §16.4 (fallback ladder); DR
+v3.0.12 (joint sweep, current best operating point), DR v3.0.16/17
+(information and model not the ceiling). Hyperliquid fee schedule
+(per public docs as of 2026): base 0.045% taker, $25M+ + HYPE stake
+unlock 0.024% taker.
+
+---
+
 ## 2026-05-14 — Decision v3.0.17 — L1 ResNet-LSTM (Test 2) (DR)
 
 **Context**: After DR v3.0.16 ruled out information as the bottleneck
