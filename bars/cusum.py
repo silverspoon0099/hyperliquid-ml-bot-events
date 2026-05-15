@@ -474,6 +474,9 @@ def main(argv: list[str]) -> int:
                    help="Stream + compute + print; no DB writes.")
     p.add_argument("--symbol", default="BTC",
                    help="DR v3.0.14: asset symbol (BTC|ETH). Default BTC.")
+    p.add_argument("--threshold", type=float, default=None,
+                   help="DR v3.0.20: override CUSUM threshold (e.g., 0.01, 0.015). "
+                        "Default reads from config.yaml bars.threshold.{SYM}.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -485,8 +488,11 @@ def main(argv: list[str]) -> int:
     sym = symbol_short(args.symbol).upper()
 
     cfg = load_config()
-    # Threshold: per-symbol if defined, else fall back to BTC default
-    threshold = cfg["bars"]["threshold"].get(sym, cfg["bars"]["threshold"]["BTC"])
+    # Threshold: CLI override > per-symbol > BTC default
+    if args.threshold is not None:
+        threshold = args.threshold
+    else:
+        threshold = cfg["bars"]["threshold"].get(sym, cfg["bars"]["threshold"]["BTC"])
     max_duration_h = cfg["bars"]["max_bar_duration_hours"]
 
     init_schema(

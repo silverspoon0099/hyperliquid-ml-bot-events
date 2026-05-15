@@ -379,20 +379,32 @@ def run_label(
     month_filter: Optional[date] = None,
     dry_run: bool = False,
     symbol: str = "BTC",
+    threshold_override: Optional[float] = None,
+    output_suffix: str = "",
 ) -> dict:
-    """Build labels for one symbol; writes labels_{sym}.parquet (DR v3.0.14)."""
+    """Build labels for one symbol; writes labels_{sym}{suffix}.parquet.
+
+    DR v3.0.14: multi-asset (symbol).
+    DR v3.0.20: threshold_override + output_suffix to support alternate
+    CUSUM bar thresholds (1.0%, 1.5%) without overwriting the 2% baseline.
+    """
     from data.db import symbol_short
     sym = symbol_short(symbol)
     cfg = load_config()
-    _check_frozen_params(cfg)
+    # Frozen-param check disabled when running at non-default threshold (DR v3.0.20)
+    if threshold_override is None:
+        _check_frozen_params(cfg)
 
-    threshold = cfg["bars"]["threshold"].get(sym.upper(), cfg["bars"]["threshold"]["BTC"])
+    if threshold_override is not None:
+        threshold = threshold_override
+    else:
+        threshold = cfg["bars"]["threshold"].get(sym.upper(), cfg["bars"]["threshold"]["BTC"])
     tp_pct = cfg["labeling"]["tp_pct"].get(sym.upper(), cfg["labeling"]["tp_pct"]["BTC"])
     sl_pct = cfg["labeling"]["sl_pct"].get(sym.upper(), cfg["labeling"]["sl_pct"]["BTC"])
     vertical_bars = cfg["labeling"]["vertical_bars"]
 
     output_dir = PROJECT_ROOT / "data" / "storage" / "labels"
-    output_path = output_dir / f"labels_{sym}.parquet"
+    output_path = output_dir / f"labels_{sym}{output_suffix}.parquet"
 
     LOG.info("loading bars: symbol=%s threshold=%s month=%s",
              symbol, threshold,
@@ -440,6 +452,11 @@ def main(argv: list[str]) -> int:
                    help="Build in memory + report; do not write parquet.")
     p.add_argument("--symbol", default="BTC",
                    help="DR v3.0.14: asset symbol (BTC|ETH). Default BTC.")
+    p.add_argument("--threshold", type=float, default=None,
+                   help="DR v3.0.20: override CUSUM bar threshold (e.g., 0.01, 0.015). "
+                        "Bypasses spec §10.1 freeze check.")
+    p.add_argument("--output-suffix", default="",
+                   help="DR v3.0.20: suffix for output parquet (e.g., '_thr010').")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -455,7 +472,9 @@ def main(argv: list[str]) -> int:
         month_filter = date.fromisoformat(args.month + "-01")
 
     try:
-        run_label(month_filter=month_filter, dry_run=args.dry_run, symbol=sym)
+        run_label(month_filter=month_filter, dry_run=args.dry_run, symbol=sym,
+                  threshold_override=args.threshold,
+                  output_suffix=args.output_suffix)
     finally:
         close_pool()
     return 0

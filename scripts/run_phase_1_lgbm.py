@@ -57,11 +57,15 @@ def _load_config() -> dict:
         return yaml.safe_load(f)
 
 
-def _load_features(tier1: bool = False, v2: bool = False, asset: str = "BTC") -> pd.DataFrame:
+def _load_features(tier1: bool = False, v2: bool = False, asset: str = "BTC",
+                   path_override: Optional[str] = None) -> pd.DataFrame:
     """Read features parquet.
     - tier1=True: DR v3.0.13 extended 48-feature set
     - v2=True:    DR v3.0.16 order-flow + HTF 41-feature set
+    - path_override: DR v3.0.20 — load from arbitrary path (e.g., features_btc_thr010.parquet)
     DR v3.0.14: asset=BTC|ETH selects features_{sym}{suffix}.parquet."""
+    if path_override is not None:
+        return pd.read_parquet(path_override)
     from data.db import symbol_short
     sym = symbol_short(asset)
     if tier1 and v2:
@@ -76,27 +80,34 @@ def _load_features(tier1: bool = False, v2: bool = False, asset: str = "BTC") ->
     return pd.read_parquet(path)
 
 
-def _load_labels(asset: str = "BTC") -> pd.DataFrame:
-    """DR v3.0.14: asset=BTC|ETH selects labels_{sym}.parquet."""
+def _load_labels(asset: str = "BTC",
+                 path_override: Optional[str] = None) -> pd.DataFrame:
+    """DR v3.0.14: asset=BTC|ETH selects labels_{sym}.parquet.
+    DR v3.0.20: path_override loads from arbitrary path."""
+    if path_override is not None:
+        return pd.read_parquet(path_override)
     from data.db import symbol_short
     sym = symbol_short(asset)
     return pd.read_parquet(PROJECT_ROOT / f"data/storage/labels/labels_{sym}.parquet")
 
 
-def _load_bars_close(asset: str = "BTC") -> pd.DataFrame:
+def _load_bars_close(asset: str = "BTC", bar_threshold: float = 0.02) -> pd.DataFrame:
+    """DR v3.0.20: filter by bar_threshold (defaults to 2% per spec)."""
     from data.db import bars_table
     sql = (f"SELECT bar_id, bar_close_ts, close FROM {bars_table(asset)} "
+           f"WHERE threshold_pct = {bar_threshold} "
            f"ORDER BY bar_close_ts, bar_id")
     return pd.read_sql_query(sql, get_engine())
 
 
-def _load_bars_ohlc(asset: str = "BTC") -> pd.DataFrame:
+def _load_bars_ohlc(asset: str = "BTC", bar_threshold: float = 0.02) -> pd.DataFrame:
     """Load full OHLC needed for in-memory relabeling (DR v3.0.11). DR v3.0.14
-    multi-asset: asset=BTC|ETH."""
+    multi-asset: asset=BTC|ETH. DR v3.0.20: filter by bar_threshold."""
     from data.db import bars_table
     sql = f"""
         SELECT bar_id, bar_open_ts, bar_close_ts, close, high, low
         FROM {bars_table(asset)}
+        WHERE threshold_pct = {bar_threshold}
         ORDER BY bar_close_ts, bar_id
     """
     return pd.read_sql_query(sql, get_engine())
@@ -884,11 +895,16 @@ def run_joint_tb_threshold_sweep(
     tier1: bool = False,
     v2: bool = False,
     asset: str = "BTC",
+    features_path: Optional[str] = None,
+    bar_threshold: float = 0.02,
+    out_suffix: str = "",
 ) -> dict:
-    """DR v3.0.12 / v3.0.13 / v3.0.16: TB=0.03 × threshold sweep. In-memory
-    relabel once; training shared per fold; backtest per threshold.
+    """DR v3.0.12 / v3.0.13 / v3.0.16 / v3.0.20: TB=0.03 × threshold sweep.
+    In-memory relabel once; training shared per fold; backtest per threshold.
     tier1=True reads features_{sym}_tier1.parquet (48 cols).
-    v2=True reads features_{sym}_v2.parquet (41 cols, DR v3.0.16)."""
+    v2=True reads features_{sym}_v2.parquet (41 cols, DR v3.0.16).
+    features_path overrides the parquet location (DR v3.0.20 bar-density test).
+    bar_threshold filters bars table (DR v3.0.20)."""
     from labels.triple_barrier import apply_triple_barrier
 
     cfg = _load_config()
@@ -898,11 +914,12 @@ def run_joint_tb_threshold_sweep(
     cost_bps_round_trip = bt["costs_bps_round_trip"]
     vertical_bars = cfg["labeling"]["vertical_bars"]
 
-    LOG.info("loading features (tier1=%s, v2=%s, asset=%s) + bars (with OHLC)...",
-             tier1, v2, asset)
-    feats = _load_features(tier1=tier1, v2=v2, asset=asset)
-    bars_full = _load_bars_ohlc(asset=asset)
+    LOG.info("loading features (tier1=%s, v2=%s, asset=%s, bar_thr=%s) + bars (with OHLC)...",
+             tier1, v2, asset, bar_threshold)
+    feats = _load_features(tier1=tier1, v2=v2, asset=asset, path_override=features_path)
+    bars_full = _load_bars_ohlc(asset=asset, bar_threshold=bar_threshold)
     feature_cols = [c for c in feats.columns if c not in KEY_COLS]
+    LOG.info("loaded: %d features, %d bars at thr=%s", len(feats), len(bars_full), bar_threshold)
 
     LOG.info("relabeling at TB=tp=sl=%.2f...", tb)
     labels_df = apply_triple_barrier(
@@ -1055,10 +1072,13 @@ def run_joint_tb_threshold_sweep(
         feat_suffix = "_tier1"
     elif v2:
         feat_suffix = "_v2"
+    elif out_suffix:
+        feat_suffix = out_suffix  # DR v3.0.20: e.g., "_thr010" / "_thr015"
     else:
         feat_suffix = ""
     fname = f"joint_tb03_threshold_sweep{asset_suffix}{feat_suffix}.json"
     out["asset"] = asset
+    out["bar_threshold"] = bar_threshold
     out_path = PROJECT_ROOT / "reports" / "phase_1" / fname
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(out, indent=2, default=str))
@@ -1357,6 +1377,14 @@ def main(argv: list[str]) -> int:
                    help="DR v3.0.16: read features_{sym}_v2.parquet "
                         "(41 features = 33 + 5 order flow + 3 HTF). "
                         "Mutually exclusive with --tier1-features.")
+    p.add_argument("--features-path", default=None,
+                   help="DR v3.0.20: override features parquet path (e.g., "
+                        "data/storage/features/features_btc_thr010.parquet).")
+    p.add_argument("--bar-threshold", type=float, default=0.02,
+                   help="DR v3.0.20: bar threshold to filter bars table "
+                        "(default 0.02; use 0.01 or 0.015 for finer bars).")
+    p.add_argument("--out-suffix", default="",
+                   help="DR v3.0.20: suffix for output JSON (e.g., '_thr010').")
     p.add_argument("--asset", default="BTC",
                    help="DR v3.0.14: asset symbol (BTC|ETH). Default BTC.")
     args = p.parse_args(argv[1:])
@@ -1373,6 +1401,9 @@ def main(argv: list[str]) -> int:
             out = run_joint_tb_threshold_sweep(
                 first_n=args.first_n, tier1=args.tier1_features,
                 v2=args.v2_features, asset=asset,
+                features_path=args.features_path,
+                bar_threshold=args.bar_threshold,
+                out_suffix=args.out_suffix,
             )
             print_joint_sweep_report(out)
         elif args.cost_sweep:

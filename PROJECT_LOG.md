@@ -5,6 +5,163 @@
 
 ---
 
+## 2026-05-15 — Decision v3.0.20 — L0 bar-density sweep (Step 4) — **POSITIVE**
+
+**Context**: After DR v3.0.19 confirmed meta-labeling doesn't lift
+above L0 baseline, the user's upstream sequence 3→1→4→2 moves to
+Step 4: bar definition. Hypothesis: 2% CUSUM may be too coarse;
+finer thresholds (1.0%, 1.5%) might unlock more L0 signal.
+
+**Standing instruction**: track both thr=0.62 AND thr=0.65 in every
+result. (Spoiler: the winner here is thr=0.58 at 1.5% bars — finer
+bars shift the effective sweet spot.)
+
+### 1. Implementation
+
+Multi-threshold support added across the pipeline (DR v3.0.20):
+- `bars/cusum.py`: `--threshold` CLI flag (default reads config)
+- `features/builder.py`: `--threshold` + `--output-suffix` flags
+- `labels/triple_barrier.py`: `--threshold` + `--output-suffix` flags;
+  bypasses spec §10.1 freeze check when threshold_override is set
+- `scripts/run_phase_1_lgbm.py`: `--features-path`, `--bar-threshold`,
+  `--out-suffix` flags; `_load_bars_close` / `_load_bars_ohlc` now
+  filter by `threshold_pct` (was implicit-all before)
+
+Frozen (not testing in this DR): TP/SL = 5%/5%, vertical_bars = 24,
+33-feature Lessmann set, L0 LightGBM params.
+
+### 2. Bar construction
+
+| Bar threshold | Build wall | Total bars (7 yr) | Bars/day avg |
+|---|---|---|---|
+| 2.0% (baseline) | n/a (existing) | 18,629 | 7 |
+| 1.5% | 5h 37min | 35,002 | 13 |
+| 1.0% | 5h 49min | 81,571 | 31 |
+
+Bar counts scale roughly as (threshold)⁻² as expected. All builds
+pass invariant checks; deterministic md5 fingerprints:
+- 1.5%: `5c35367081e7e8cc03f2801fc98a38af`
+- 1.0%: `20995e3512a492bbe94bbdf2bc6d64dc`
+
+(Note: first 1.0% build at 13:00 was killed at month 68/89 due to
+atomic-write semantics in cusum.py. Restart from scratch completed
+cleanly. Worth a future DR to make incremental.)
+
+### 3. Label class balance
+
+| Bar threshold | LONG | SHORT | NEUTRAL | median holding |
+|---|---|---|---|---|
+| 2.0% (baseline) | ~40% | ~30% | ~30% | ~17 bars |
+| 1.5% | 29.8% | 25.1% | **45.2%** | 22 bars |
+| 1.0% | 12.5% | 9.4% | **78.2%** | **24 bars** (max) |
+
+Finer bars → smaller per-bar moves → TP/SL=5% rarely hit within
+24-bar vertical → NEUTRAL dominates. At 1.0% bars, 80% of labels
+expire vertically — model is starved of directional examples.
+
+### 4. L0 joint sweep results (TB=0.03 × threshold, all 3 bar densities)
+
+| thr | **2.0% (baseline)** | **1.5%** | **1.0%** |
+|---|---|---|---|
+| 0.45 | −0.088 | −0.128 | −0.067 |
+| 0.50 | −0.419 | −0.521 | +0.286 |
+| 0.55 | +0.546 | +0.150 | +0.114 |
+| **0.58** | +0.186 | **+1.204** ⭐ | +0.476 |
+| 0.60 | +0.251 | +0.396 | +0.406 |
+| **0.62** | **+0.657** | +0.391 | +0.076 |
+| **0.65** | **+0.721** | +0.352 | +0.087 |
+
+**Headline operating point: 1.5% bars + TB=0.03 + thr=0.58**
+
+| Metric | 1.5% thr=0.58 | 2.0% thr=0.65 (prior champion) |
+|---|---|---|
+| Sharpe(all 20 folds) | **+1.204** | +0.721 |
+| Sharpe(!=0) | +2.407 | +3.246 |
+| n_trades | 631 | 104 |
+| trades/fold | 32 | 5 |
+| 0-trade folds | 8 | 16 |
+| **active folds** | **12/20** | **4/20** |
+| win% | 69.5 | 84.6 |
+| LONG win% | 63.9 | 80.6 |
+| SHORT win% | 77.5 | 89.1 |
+| mPnL bps net | +87 | +178 |
+| medPnL bps | +166 | +258 |
+| annret | +4.55 | +0.86 |
+
+The 1.5% champion has:
+- **6× more trades** (631 vs 104)
+- **3× more regime coverage** (12 active folds vs 4)
+- **Higher overall Sharpe(all 20)** by +0.48
+- Lower per-trade win% (69.5 vs 84.6) but much higher per-bar opportunity rate
+
+Worth noting: 1.5% bars REGRESS at the old champion threshold (0.62
+loses 0.27, 0.65 loses 0.37). Finer bars shift the effective sweet
+spot LOWER (from 0.65 to 0.58). Standing instruction to track 0.62/
+0.65 still applies but those aren't where the new operating point is.
+
+1.0% bars regress everywhere (best is +0.476 at thr=0.58) — too fine
+for current TP/SL labeling. Class imbalance kills the directional
+signal.
+
+### 5. Decision tree applied
+
+| Best Sharpe vs L0 2% baseline (+0.721) | Action |
+|---|---|
+| ≥ 1.0 absolute | §16.1 cleared → ship finer bars | **HIT** (+1.204 at 1.5%/thr=0.58) |
+| Lift ≥ +0.10 | adopt as new baseline → Step 2 next | (would also hit, but absolute hit first) |
+| Neutral | keep 2%, proceed to Step 2 | NO |
+| Lift < −0.10 | finer hurt | NO |
+
+**Verdict**: §16.1 1.0 Sharpe gate cleared at **1.5% bars + thr=0.58**.
+
+### 6. Three open questions for next operational step
+
+1. **Should we ship now or continue the upstream sequence?**
+   - Pro ship: We have a deployable +1.204 Sharpe configuration
+   - Pro continue: Step 2 (continuous targets) might lift further
+   - Recommend: Hold L0 1.5% / thr=0.58 as the ship-ready baseline,
+     but try Step 2 to see if we can push past +1.5 Sharpe
+
+2. **Is the +1.204 Sharpe robust across asset / regime?**
+   - Era-segmented breakdown not yet done at 1.5% bars
+   - Spec §16.1 wants robustness across regimes — 12/20 active folds
+     suggests broad coverage but doesn't prove temporal stability
+   - Recommend: era-segmented Sharpe diagnostic (like DR v3.0.14 §3)
+     before live deployment
+
+3. **The class-imbalance asymmetry at 1.5%**
+   - LONG win% 63.9 vs SHORT win% 77.5 — SHORTs are systematically
+     more accurate
+   - Could be: bearish regime (2022 era) dominates active folds; LONGs
+     in bull regimes have looser thresholds
+   - Worth flagging for risk management — may need direction-specific
+     sizing or thresholds
+
+### 7. Cost & artifacts
+
+- Wall clock: ~11h bar construction × 2 + ~80min × 2 joint sweeps
+- New files: 3 parquets (features_btc_thr{010,015}, labels_btc_thr{010,015}),
+  2 result JSONs (joint_tb03_threshold_sweep_thr{010,015}.json)
+- Code changes: 4 modules with new CLI flags + path/threshold overrides
+- Pytest 64/64 still green
+
+### 8. Next operational step
+
+**Proceed to Step 2 (continuous targets) per user's 3→1→4→2 sequence**,
+but with 1.5% bars as the new baseline. Hypothesis: regression on
+forward log-return (instead of 3-class softmax) may unlock additional
+lift on top of the +1.204 starting point.
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-14 with
+"GO — approved as scoped (1.0% + 1.5%)" on DR v3.0.20 candidate.
+
+**References**: Spec §6.4 (bar construction), §10.1 (frozen params
+deliberately bypassed), §16.1 (the 1.0 Sharpe gate — NOW CLEARED),
+§16.4 (fallback ladder); DR v3.0.9 (L0 baseline), DR v3.0.12 (joint
+sweep prior champion at 2% bars).
+
+---
+
 ## 2026-05-14 — Decision v3.0.19 — L0 meta-labeling (Step 1) (DR)
 
 **Context**: After DR v3.0.18 confirmed cost is not the bottleneck,

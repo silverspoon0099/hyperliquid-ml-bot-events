@@ -393,13 +393,19 @@ def run_build(
     month_filter: Optional[date] = None,
     dry_run: bool = False,
     symbol: str = "BTC",
+    output_suffix: str = "",
 ) -> dict:
-    """Build features for one symbol; writes features_{sym}.parquet (DR v3.0.14)."""
+    """Build features for one symbol; writes features_{sym}{suffix}.parquet.
+
+    DR v3.0.14: multi-asset (symbol).
+    DR v3.0.20: output_suffix (e.g., "_thr010") to avoid colliding with
+    the default 2% CUSUM features parquet.
+    """
     from data.db import symbol_short
     sym = symbol_short(symbol)
     cfg = load_config()
     output_dir = PROJECT_ROOT / cfg["features"]["output_dir"]
-    output_path = output_dir / f"features_{sym}.parquet"
+    output_path = output_dir / f"features_{sym}{output_suffix}.parquet"
 
     LOG.info("loading bars: symbol=%s threshold=%s month=%s",
              symbol, threshold,
@@ -446,6 +452,12 @@ def main(argv: list[str]) -> int:
                    help="Build in memory + report; do not write parquet.")
     p.add_argument("--symbol", default="BTC",
                    help="DR v3.0.14: asset symbol (BTC|ETH). Default BTC.")
+    p.add_argument("--threshold", type=float, default=None,
+                   help="DR v3.0.20: override CUSUM bar threshold (e.g., 0.01, 0.015). "
+                        "Default reads from config.yaml bars.threshold.{SYM}.")
+    p.add_argument("--output-suffix", default="",
+                   help="DR v3.0.20: suffix for output parquet (e.g., '_thr010'). "
+                        "Default writes features_{sym}.parquet.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -457,7 +469,10 @@ def main(argv: list[str]) -> int:
     sym = symbol_short(args.symbol).upper()
 
     cfg = load_config()
-    threshold = cfg["bars"]["threshold"].get(sym, cfg["bars"]["threshold"]["BTC"])
+    if args.threshold is not None:
+        threshold = args.threshold
+    else:
+        threshold = cfg["bars"]["threshold"].get(sym, cfg["bars"]["threshold"]["BTC"])
 
     month_filter: Optional[date] = None
     if args.month:
@@ -465,7 +480,8 @@ def main(argv: list[str]) -> int:
 
     try:
         run_build(threshold=threshold, month_filter=month_filter,
-                  dry_run=args.dry_run, symbol=sym)
+                  dry_run=args.dry_run, symbol=sym,
+                  output_suffix=args.output_suffix)
     finally:
         close_pool()
     return 0
