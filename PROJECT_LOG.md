@@ -5,6 +5,128 @@
 
 ---
 
+## 2026-05-17 — Decision v3.0.21 — L0 continuous regression (Step 2) — NEGATIVE
+
+**Context**: After DR v3.0.20 cleared §16.1 with 1.5% bars + thr=0.58
+(Sharpe +1.204), the user authorized Step 2 of the upstream sequence
+3→1→4→2: continuous regression targets. Hypothesis: replacing 3-class
+softmax with magnitude-aware regression preserves information (a 4.9%
+move just-missing-TP is currently treated identically to a flat bar).
+
+**Locked baseline before this DR**: `v3.0.20-champion-baseline` tag
+on commit `2364b76` (1.5% bars + TB=0.03 + thr=0.58 = +1.204 Sharpe).
+
+### 1. Scope (Phase A only — Phase B skipped per result)
+
+Phased plan (per user GO):
+- **Phase A** (this report): Option 4 from design menu — target =
+  log(exit_price / entry_close) using existing triple-barrier exits.
+  Cleanest test of "does magnitude preservation help?". Sweep magnitude
+  thresholds {0.005, 0.010, 0.015, 0.020, 0.025, 0.030} log-return units.
+- **Phase B** (multi-horizon ensemble, Option 3): conditional on Phase A
+  lift ≥ +0.10. **NOT RUN** — Phase A diagnosed a target-distribution
+  problem that multi-horizon won't fix.
+
+### 2. Implementation
+
+- New file: `scripts/run_phase_1_lgbm_reg.py` (~330 lines)
+  - LightGBM regression with **Huber loss** (alpha=0.9), reusing L0
+    config for other hyperparams (num_leaves, learning_rate, etc.)
+  - Target: `y = log(exit_price / entry_close)` joined from labels +
+    bars
+  - Trade construction: pseudo-probs from sign + magnitude threshold,
+    fed to existing `simulate_trades` (confidence_threshold=0.5 since
+    pseudo-probs are 0/1)
+  - Same 18-fold walk-forward, same Platt-like comparison surface
+- Reads 1.5% bars + 33-feature parquet (champion substrate)
+- No changes to existing pipeline code
+
+### 3. Result
+
+Wall clock: **42 seconds** (suspiciously fast — diagnostic below).
+
+| mag_thr | n_trd | active | win% | mPnL | **Sharpe(all)** | Sharpe(!=0) |
+|---|---|---|---|---|---|---|
+| **0.005** | **164** | **6/20** | 53.7 | +21 | **+0.080** | +0.265 |
+| 0.010 | 40 | 4/20 | 42.1 | −45 | +0.050 | +0.335 |
+| 0.015 | 15 | 2/20 | 50.0 | +3 | +0.003 | +0.033 |
+| 0.020 | 2 | 1/20 | 50.0 | +69 | +0.018 | +0.353 |
+| 0.025 | 0 | 0/20 | – | – | 0.000 | 0.000 |
+| 0.030 | 0 | 0/20 | – | – | 0.000 | 0.000 |
+
+**Best regression Sharpe(all) = +0.080** vs categorical champion +1.204
+→ **lift = −1.124**. Regression is dramatically worse.
+
+### 4. Diagnostic: why regression failed
+
+Per-fold prediction ranges (from training log):
+- 17 of 20 folds: pred_min/max within ±0.005 (essentially predicting mean)
+- 3 folds (11, 14, 20): pred range up to ±0.024 — these are the ones
+  producing the few trades at higher mag_thresholds
+
+**Root cause**: the regression target distribution is dominated by
+NEUTRAL outcomes (45% of 1.5% labels are vertical-exit timeouts with
+returns near 0). Only 55% are TP/SL hits with ±0.0488 magnitudes.
+Huber loss naturally down-weights the ±0.05 outliers and the
+conditional-mean predictor converges to ≈ 0.
+
+The model isn't broken — it's correctly minimizing Huber loss on a
+target where the mean is uninformative. The categorical setup avoids
+this by treating direction as a classification task (no magnitude
+averaging).
+
+Wall clock 42s vs joint sweep 80min is the smoking gun: early stopping
+triggered immediately because val Huber loss stabilized in <50 trees.
+
+### 5. Why Phase B was skipped
+
+Phase B was multi-horizon ensemble of the SAME target framing. Same
+target distribution issue applies. Multi-horizon would just give three
+"predicting near zero" models instead of one. The root cause is target
+formulation, not model architecture.
+
+### 6. Decision tree applied
+
+| Branch | Trigger | Hit? |
+|---|---|---|
+| Lift ≥ +0.20 → new champion + Phase B | +1.204 + 0.20 = +1.40 | NO (got +0.080) |
+| Lift ∈ [0, +0.20] → marginal, ship categorical | – | NO (negative lift) |
+| **Lift < 0 → regression unhelpful, ship categorical** | **HIT** | ✓ |
+
+**Verdict**: Step 2 (continuous regression on PnL-equivalent target) is
+**NEGATIVE**. The +1.204 categorical champion remains the official
+operating baseline.
+
+### 7. What this means for the upstream sequence
+
+The full 3→1→4→2 sequence is now complete:
+- Step 3 (cost): NEGATIVE
+- Step 1 (meta-labeling): NEGATIVE
+- **Step 4 (bar definition): POSITIVE** ← unlocked §16.1
+- Step 2 (continuous regression): NEGATIVE
+
+Only Step 4 mattered. The +1.204 baseline at 1.5% bars + TB=0.03 +
+thr=0.58 stands as the project's operational champion.
+
+### 8. Optional follow-up (not running by default)
+
+A DIFFERENT regression target framing — fixed-horizon forward log-return
+`log(close[i+24]/close[i])` — has a smoother (not-truncated)
+distribution and could plausibly avoid the conditional-mean trap. Open
+for a future DR v3.0.22 candidate if curiosity strikes; not required by
+the current decision tree.
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-17 with
+"GO — Phase A first, Phase B conditional" and confirmed "Commit
+v3.0.21 as NEGATIVE, ship +1.204 categorical" after Phase A result.
+
+**References**: Spec §10.1 (frozen params), §16.1 (1.0 Sharpe gate
+CLEARED at v3.0.20); DR v3.0.20 (champion baseline locked as
+`v3.0.20-champion-baseline`); DR v3.0.19 (meta-labeling NEGATIVE),
+DR v3.0.18 (cost-structure NEGATIVE).
+
+---
+
 ## 2026-05-15 — Decision v3.0.20 — L0 bar-density sweep (Step 4) — **POSITIVE**
 
 **Context**: After DR v3.0.19 confirmed meta-labeling doesn't lift
