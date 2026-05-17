@@ -5,6 +5,132 @@
 
 ---
 
+## 2026-05-17 — Decision v3.0.22 — Multi-asset Phase B: ETH at 1.5% bars — MARGINAL
+
+**Context**: After DR v3.0.20 cleared §16.1 with BTC at 1.5% bars
+(+1.204 Sharpe), user authorized concurrent runs of v3.0.22
+(multi-asset portability test) and v3.0.23 (paper deployment).
+Hypothesis: the +1.204 recipe is partly a property of crypto event-bar
+dynamics in general (would transfer to ETH), or partly a property of
+BTC market structure specifically (would not).
+
+ETH ticks already ingested (1.93B aggTrades 2019-2026 from DR v3.0.14).
+No new ingestion needed.
+
+### 1. Scope
+
+ETH-only first per user's risk-managed framing. If ETH lift ≥ +0.40
+over its Era 3 baseline, expand to SOL/LINK (per spec §4.2 Phase B).
+
+Pipeline (re-run of v3.0.20 recipe on ETH):
+- Build CUSUM 1.5% bars for ETH (~5h wall — actually ran fast because
+  ETH ticks ~half BTC's volume)
+- features_eth_thr015.parquet (~30s)
+- labels_eth_thr015.parquet (~5s)
+- L0 joint sweep at TB=0.03 × {0.45..0.65} thresholds (~2.5min — fast
+  because ETH has fewer bars than BTC at 1.5%)
+
+### 2. Bars + labels metadata
+
+| Asset @ 1.5% | Total bars | LONG | SHORT | NEUTRAL | median holding |
+|---|---|---|---|---|---|
+| BTC | 35,002 | 29.8% | 25.1% | 45.2% | 22 bars |
+| **ETH** | **32,044** | **48.5%** | **43.0%** | **8.5%** | **15 bars** |
+
+ETH labels are **much less NEUTRAL** than BTC (8.5% vs 45.2%). ETH price
+hits TP/SL more often within the 24-bar vertical at 1.5% bars — likely
+because ETH has higher per-bar volatility relative to its 1.5% trigger.
+Better label balance is friendlier for LGBM training.
+
+### 3. Joint sweep result (TB=0.03 × threshold, 1.5% bars)
+
+| thr | n_trades | active | win% | mPnL | **Sharpe(all)** | Sharpe(!=0) |
+|---|---|---|---|---|---|---|
+| 0.45 | 3265 | 20/20 | 51.8 | −2 | −0.478 | −0.478 |
+| 0.50 | 2880 | 19/20 | 51.9 | +3 | −0.278 | −0.292 |
+| **0.55** | **1034** | **16/20** | **55.9** | **+24** | **+0.430** | +0.614 |
+| 0.58 | 563 | 10/20 | 42.2 | −51 | −0.570 | −1.424 |
+| 0.60 | 271 | 7/20 | 50.7 | +27 | −0.162 | −0.646 |
+| 0.62 | 106 | 4/20 | 53.9 | +31 | −0.244 | −1.628 |
+| 0.65 | 39 | 4/20 | 54.9 | +22 | −0.356 | −2.374 |
+
+**ETH best Sharpe(all) = +0.430 at thr=0.55** (different optimal
+threshold than BTC's 0.58 at 1.5%).
+
+### 4. Comparison vs ETH 2% baseline (DR v3.0.14 Era 3 result)
+
+- ETH 2% Era 3 best Sharpe ~+0.11 (mostly at thr=0.55)
+- ETH 1.5% best Sharpe **+0.430** at thr=0.55
+- **Lift: +0.32** absolute
+
+ETH benefits from finer bars (consistent with BTC finding) but the
+absolute Sharpe is far below:
+- BTC 1.5% champion: +1.204 (lift over BTC 2% best of +0.48)
+- §16.1 gate: 1.0
+
+### 5. Decision tree applied
+
+| Branch | Trigger | Hit? |
+|---|---|---|
+| ETH Sharpe ≥ 1.0 | multi-asset robust, expand SOL/LINK | NO (+0.43) |
+| **ETH lift ≥ +0.40 over Era 3 baseline** | meaningful, expand SOL/LINK with caveats | **NO (lift +0.32)** |
+| ETH lift < +0.40 | BTC-specific signal | **HIT** |
+
+**Verdict**: ETH does NOT meet the expansion threshold. BTC remains
+the deployment champion. SOL/LINK expansion not justified by this result.
+
+### 6. Honest interpretation
+
+The recipe (1.5% CUSUM + TP/SL 5% / 24-bar + 33 features + L0 + thr~0.55-0.58)
+generalizes PARTIALLY across BTC and ETH:
+- **Direction**: bar-density refinement helps both (BTC +0.48 lift,
+  ETH +0.32 lift over their 2% baselines)
+- **Magnitude**: BTC has dramatically more signal at any density level
+  (champion +1.204 vs ETH +0.43)
+- **Operating threshold differs**: BTC champion at thr=0.58; ETH best
+  at thr=0.55 — finer bars + ETH's lower per-bar return distribution
+  shifts the optimal lower
+
+This is consistent with prior findings (DR v3.0.14): ETH 2026 market
+structure differs from BTC (lower volatility per unit time, more
+institutional flow, less momentum). The recipe captures *some* universal
+crypto-event-bar dynamics but BTC's specific microstructure produces
+substantially more learnable signal.
+
+### 7. Why we don't expand to SOL/LINK
+
+Per spec §4.2 Phase B and DR v3.0.14: SOL/LINK have different
+per-asset CUSUM threshold optima (Lessmann: LINK was 5% CUSUM / TB 8%).
+Re-running the recipe at fixed 1.5% wouldn't be a fair test —
+would need per-asset bar threshold + TB tuning (~2-3 days per asset).
+
+Given ETH already shows the recipe's portability is limited, expanding
+to SOL/LINK with the same fixed config would likely produce similar
+"marginal" results. The expansion is deferred to a future DR if/when
+per-asset tuning is desired.
+
+### 8. Operational implication
+
+**No change to deployment plan.** BTC 1.5% + thr=0.58 + L0 (+1.204
+Sharpe, locked at tag v3.0.20-champion-baseline) remains the
+operational baseline. Paper trading (v3.0.23) targets BTC-only.
+
+ETH 1.5% (+0.43) could be a future deployment if we want diversification,
+but at the cost of much lower expected Sharpe and the cross-asset
+correlation question (BTC and ETH move together; running both at 1.5%
+isn't truly independent diversification).
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-17 with
+"GO — ETH only first; SOL/LINK conditional on ETH lift" on DR v3.0.22
+candidate.
+
+**References**: Spec §4.2 (multi-asset universe); DR v3.0.14 (ETH 2%
+result — Era 3 best +0.11); DR v3.0.20 (BTC 1.5% champion); spec
+§16.4 (fallback ladder); Lessmann §"Extensibility to other
+cryptocurrencies".
+
+---
+
 ## 2026-05-17 — Decision v3.0.21 — L0 continuous regression (Step 2) — NEGATIVE
 
 **Context**: After DR v3.0.20 cleared §16.1 with 1.5% bars + thr=0.58
