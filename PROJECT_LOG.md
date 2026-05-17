@@ -5,6 +5,168 @@
 
 ---
 
+## 2026-05-17 — Decision v3.0.23 — Paper-trading deployment (Phase A')
+
+**Context**: After DR v3.0.20 cleared §16.1 (BTC 1.5% bars + thr=0.58 =
++1.204 Sharpe), this DR builds the live-paper-trading infrastructure
+to validate the backtest signal in real-time before any real-money
+deployment.
+
+**Locked baseline**: `v3.0.20-champion-baseline` tag. Paper trading
+uses this exact recipe.
+
+### 1. Architecture (locked design)
+
+Polling daemon, 10-minute cycle:
+- **Tick source**: Binance.com REST `/api/v3/aggTrades` (matches
+  training data — DR v3.0.16 etc. ingested from data.binance.vision
+  archive of the same source). Requires HTTPS_PROXY or BINANCE_PROXY
+  env var because api.binance.com returns HTTP 451 from many regions.
+- **Execution venue**: Hyperliquid (paper-simulated; real cost model
+  via DR v3.0.18 — 7 bps RT realistic scenario)
+- **Model**: fixed snapshot trained once at session start, used for
+  entire 2-week eval window
+- **State**: Postgres (events.paper_sessions, paper_trades, paper_decisions);
+  restart-safe via idempotent inserts + DB-as-source-of-truth
+- **Stop**: HALT flag file OR daily DD ≥ 5% (config max_daily_loss_pct)
+
+### 2. New components
+
+- **DB schema** (data/db.py, init_paper_schema):
+  - `events.paper_sessions` — session metadata (config snapshot + end state)
+  - `events.paper_trades` — entries/exits with PnL, status='open'|'exited'
+  - `events.paper_decisions` — every L0 prediction + decision (audit trail)
+- **`scripts/train_and_persist_l0.py`** — Trains L0 LightGBM on full
+  historical data (1.5% bars, TB=0.03), fits Platt on tail 20%, saves
+  as versioned pickle (`data/storage/models/l0_btc_thr015_v{N}.pkl`)
+  with companion JSON metadata. Initial artifact `v1` produced: 27,982
+  train + 6,996 val bars, val_logloss=0.84, ratio=0.83 (pre-gate PASS),
+  24 trees, 0.50 MB.
+- **`live/binance_rest.py`** — REST aggTrades fetcher with incremental
+  catch-up via last-agg_id checkpoint. Honors HTTPS_PROXY env (and
+  optional BINANCE_PROXY for explicit override). Idempotent insert via
+  ON CONFLICT DO NOTHING.
+- **`live/paper_exec.py`** — `PaperTradeManager` class: open_trade,
+  check_open_trades (applies triple-barrier exit logic via direct DB
+  bar queries), session_summary, todays_realized_loss_pct (for DD-kill).
+  Mirrors `backtest/runner.py` PnL semantics for live-vs-backtest parity.
+- **`live/audit_log.py`** — JSONL event logger with daily UTC rotation.
+  Threadsafe, line-buffered, append-only.
+- **`scripts/run_paper_trading_loop.py`** — Top-level orchestrator.
+  Signal handlers for SIGINT/SIGTERM. Idempotent loop iteration:
+  poll ticks → rebuild current-month bars (with empty-month skip) →
+  compute features for new bars → L0 inference → trade decision →
+  log decision → check open exits → daily DD check → halt check.
+
+### 3. Smoke test result (without proxy)
+
+One-shot run completed cleanly in 2.7s with expected graceful
+degradation:
+- Artifact loaded (0.50 MB)
+- Session created in DB
+- Binance fetch returned 451 (geo-block), logged + continued
+- No ticks in current month → bars rebuild skipped (correct behavior)
+- No new bars → no decisions made
+- Session ended with end_reason="one_shot_complete"
+
+The pipeline is functional. **Live operation pending user proxy
+configuration** (set HTTPS_PROXY or BINANCE_PROXY env to a Binance.com
+forward proxy in the user's network).
+
+### 4. Bug surfaced + fixed during smoke
+
+Initial smoke crashed inside `bars.cusum.build_bars(month=2026-05)`
+with `psycopg.DataError: bad copy data: length exceeding data`. Root
+cause: empty TimescaleDB query result against BINARY format COPY
+appears to confuse psycopg's binary parser.
+
+Fix: orchestrator pre-checks `_has_ticks_in_month()` before invoking
+cusum.build_bars. If no ticks for the current calendar month, skip
+the rebuild (logged as "no_ticks_in_current_month"). The underlying
+psycopg/TimescaleDB interaction may be worth a dedicated DR but is
+not blocking for paper trading.
+
+### 5. Operational instructions for user
+
+1. **Configure proxy** for api.binance.com access:
+   ```bash
+   export HTTPS_PROXY=http://your-proxy:port
+   # OR (Binance-specific):
+   export BINANCE_PROXY=http://your-proxy:port
+   ```
+2. **Train model artifact** (one-time):
+   ```bash
+   python -m scripts.train_and_persist_l0 \
+     --asset BTC --bar-threshold 0.015 --tb 0.03
+   ```
+3. **Launch paper trading loop**:
+   ```bash
+   python -m scripts.run_paper_trading_loop \
+     --asset BTC --bar-threshold 0.015 \
+     --poll-seconds 600 \
+     --notes "2-week paper eval after v3.0.20 champion"
+   ```
+4. **Stop gracefully**:
+   ```bash
+   touch /tmp/paper_trading_HALT
+   # daemon halts at next iteration boundary
+   ```
+5. **Inspect activity**:
+   ```sql
+   -- All decisions for current session:
+   SELECT * FROM events.paper_decisions
+   WHERE session_id = 'btc_thr015_YYYYMMDD'
+   ORDER BY bar_id;
+
+   -- Trade summary:
+   SELECT status, COUNT(*), AVG(pnl_bps_net), SUM(pnl_bps_net)
+   FROM events.paper_trades
+   WHERE session_id = 'btc_thr015_YYYYMMDD'
+   GROUP BY status;
+   ```
+
+### 6. Evaluation plan (after 2 weeks)
+
+After 2 weeks of paper trading:
+- **Sharpe check**: realized PnL stream daily-resampled Sharpe × √252
+  should be in the +1.0 ± 0.5 range to validate backtest signal
+- **Decision audit**: cross-check L0 predictions vs offline re-run on
+  same bars (must match exactly — proves no train/serve skew)
+- **Win-rate sanity**: ~65-70% expected (matches backtest 69.5%)
+- **Trade frequency**: ~13 bars/day expected; ~26 decisions over 14 days
+  → maybe 3-8 trades depending on confidence distribution
+
+### 7. Known limitations / future work
+
+- **Proxy dependency**: requires user infrastructure (out-of-scope for this DR)
+- **Cusum bug**: psycopg BINARY COPY on empty TimescaleDB chunks fails;
+  worked around but root cause unfixed
+- **No real execution yet**: Hyperliquid API integration deferred to
+  future DR. Current paper exec simulates entry/exit via offline-style
+  triple-barrier on real bars
+- **One asset**: BTC-only (per DR v3.0.22 ETH was marginal, didn't
+  justify expansion)
+- **Pytest coverage**: live/ module not yet covered. Should add tests
+  if/when this moves to real execution
+
+### 8. Status
+
+**Code shipped, ready to run when proxy is configured.** 64/64 tests
+green. 5 new files (~1,000 lines). Recommended workflow: user
+configures proxy → re-run smoke → launch session → check daily for
+first week → evaluate full sample at end of week 2.
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-17 with
+"GO — launch both" (v3.0.22 + v3.0.23) and refined design choices
+(Binance tick source over Hyperliquid for train/serve parity, 10-min
+poll, fixed model snapshot, DB-backed state, HALT+DD stop conditions).
+
+**References**: Spec §11 (backtesting); DR v3.0.18 (Hyperliquid cost
+schedule used in paper P&L); DR v3.0.20 (champion baseline locked as
+tag v3.0.20-champion-baseline).
+
+---
+
 ## 2026-05-17 — Decision v3.0.22 — Multi-asset Phase B: ETH at 1.5% bars — MARGINAL
 
 **Context**: After DR v3.0.20 cleared §16.1 with BTC at 1.5% bars

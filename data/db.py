@@ -219,6 +219,87 @@ def init_schema(
         conn.commit()
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Paper-trading schema (DR v3.0.23) — session metadata, trades, decisions
+# ─────────────────────────────────────────────────────────────────────────
+_DDL_PAPER_SESSIONS = """
+CREATE TABLE IF NOT EXISTS events.paper_sessions (
+    session_id              TEXT             PRIMARY KEY,
+    asset                   TEXT             NOT NULL,
+    model_artifact_path     TEXT             NOT NULL,
+    bar_threshold           DOUBLE PRECISION NOT NULL,
+    tp_pct                  DOUBLE PRECISION NOT NULL,
+    sl_pct                  DOUBLE PRECISION NOT NULL,
+    vertical_bars           INTEGER          NOT NULL,
+    confidence_threshold    DOUBLE PRECISION NOT NULL,
+    position_size_usd       DOUBLE PRECISION NOT NULL,
+    cost_bps_round_trip     DOUBLE PRECISION NOT NULL,
+    max_daily_loss_pct      DOUBLE PRECISION NOT NULL,
+    started_at              TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    ended_at                TIMESTAMPTZ,
+    end_reason              TEXT,
+    notes                   TEXT
+);
+"""
+
+_DDL_PAPER_TRADES = """
+CREATE TABLE IF NOT EXISTS events.paper_trades (
+    trade_id        BIGSERIAL        PRIMARY KEY,
+    session_id      TEXT             NOT NULL REFERENCES events.paper_sessions(session_id),
+    bar_id_entry    BIGINT           NOT NULL,
+    entry_ts        TIMESTAMPTZ      NOT NULL,
+    entry_price     DOUBLE PRECISION NOT NULL,
+    direction       SMALLINT         NOT NULL,
+    p_long          DOUBLE PRECISION NOT NULL,
+    p_short         DOUBLE PRECISION NOT NULL,
+    p_neutral       DOUBLE PRECISION NOT NULL,
+    entry_reason    TEXT             NOT NULL,
+    status          TEXT             NOT NULL DEFAULT 'open',
+    exit_bar_id     BIGINT,
+    exit_ts         TIMESTAMPTZ,
+    exit_price      DOUBLE PRECISION,
+    exit_reason     TEXT,
+    holding_bars    INTEGER,
+    pnl_bps_gross   DOUBLE PRECISION,
+    pnl_bps_net     DOUBLE PRECISION,
+    created_at      TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ      NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS paper_trades_session_status_idx
+    ON events.paper_trades(session_id, status);
+CREATE INDEX IF NOT EXISTS paper_trades_session_entry_ts_idx
+    ON events.paper_trades(session_id, entry_ts);
+"""
+
+_DDL_PAPER_DECISIONS = """
+CREATE TABLE IF NOT EXISTS events.paper_decisions (
+    session_id      TEXT             NOT NULL REFERENCES events.paper_sessions(session_id),
+    bar_id          BIGINT           NOT NULL,
+    decided_at      TIMESTAMPTZ      NOT NULL DEFAULT now(),
+    p_long          DOUBLE PRECISION NOT NULL,
+    p_short         DOUBLE PRECISION NOT NULL,
+    p_neutral       DOUBLE PRECISION NOT NULL,
+    max_prob        DOUBLE PRECISION NOT NULL,
+    argmax_class    TEXT             NOT NULL,
+    traded          BOOLEAN          NOT NULL,
+    skip_reason     TEXT,
+    trade_id        BIGINT,
+    PRIMARY KEY (session_id, bar_id)
+);
+"""
+
+
+def init_paper_schema() -> None:
+    """Create paper-trading tables (DR v3.0.23). Idempotent."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_DDL_SCHEMA)
+            cur.execute(_DDL_PAPER_SESSIONS)
+            cur.execute(_DDL_PAPER_TRADES)
+            cur.execute(_DDL_PAPER_DECISIONS)
+        conn.commit()
+
+
 def ping() -> dict:
     """Verify DB + Timescale extension reachable."""
     with get_connection() as conn:
