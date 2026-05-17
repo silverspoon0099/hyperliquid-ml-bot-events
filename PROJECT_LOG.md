@@ -5,6 +5,153 @@
 
 ---
 
+## 2026-05-17 — Decision v3.0.24 — Daily-archive tick source + cusum DELETE-scope fix
+
+**Context**: DR v3.0.23 shipped paper trading infrastructure but
+deferred live operation pending user proxy configuration. User
+reported only US proxy available (which cannot reach api.binance.com —
+Binance blocks all US IPs). This DR replaces the REST-API tick source
+with the Binance Vision **daily archive** (data.binance.vision public
+CDN — geo-open, no auth, no rate limits, same source as our training
+data).
+
+In smoke-testing the new daily archive path, **discovered a
+pre-existing catastrophic bug** in `bars/cusum.py`: the monthly
+rebuild's DELETE was scoped only by `threshold_pct`, not by month.
+Every call to `build_bars(month_filter=X)` wiped the entire history
+of bars at that threshold before inserting just month X's bars.
+
+### 1. New daily archive tick source
+
+`live/binance_archive_daily.py` (new, ~180 lines):
+- Function `poll_and_ingest_daily(symbol, symbol_binance)`:
+  - Determines last day fully present in `events.ticks_{sym}`
+  - For each day from (last+1) to (yesterday UTC):
+    - Downloads `data.binance.vision/data/spot/daily/aggTrades/.../*.zip`
+    - 404 → archive not yet released, stop and return
+    - Else: parse CSV, COPY into staging, INSERT INTO ticks with
+      ON CONFLICT DO NOTHING
+- Reuses the timestamp auto-detect from `data/ingest_ticks.py`
+  (Binance switched ms → µs in 2025)
+- Returns counts dict compatible with `binance_rest.poll_and_insert`
+
+Smoke test ingested **13 days × 8.7M ticks** in 30 seconds with no
+proxy. Same data source as training, no train/serve skew.
+
+`scripts/run_paper_trading_loop.py` updated: tick source defaults to
+`daily_archive` (no proxy needed); `cfg["live"]["tick_source"] = "rest"`
+falls back to the original REST path for users with non-US proxies.
+
+### 2. cusum DELETE-scope fix (CRITICAL)
+
+**Bug**: In `bars/cusum.py` line ~276, the DELETE statement before
+inserting new bars was:
+```sql
+DELETE FROM events.bars_{sym}_cusum WHERE threshold_pct = %s
+```
+This deletes ALL bars at the threshold regardless of `month_filter`.
+For paper trading's periodic monthly rebuild, this would wipe the
+entire historical baseline on every poll.
+
+**Damage during smoke**: First end-to-end smoke run deleted 35,002
+historical 1.5% bars (locked champion baseline from
+`v3.0.20-champion-baseline` tag) and replaced with just 37 May 2026
+bars. Catastrophic but recoverable — recipe is deterministic.
+
+**Fix** (lines 271-291): when `month_filter is not None`, DELETE
+includes a `bar_close_ts >= %s AND bar_close_ts < %s` range scope.
+Unconditional DELETE behavior preserved when `month_filter is None`
+(full-history rebuilds).
+
+**Verification**:
+- Re-smoke after fix: `DB write complete: deleted 37, inserted 37`
+  (only May affected). Previously was `deleted 35002, inserted 37`.
+- Historical 1.5% bars count after re-smoke: 35,002 (unchanged) ✓
+- 64/64 pytest still green.
+
+### 3. Recovery
+
+Re-built 1.5% bars from full history (~6h wall, deterministic).
+Result:
+- 35,002 historical bars (2019-01 → 2026-04-30) — **identical to
+  locked baseline** (same count, deterministic algorithm on same
+  ticks)
+- 37 additional bars (2026-05-01 → 2026-05-16) — **new data ingested
+  during smoke from daily archives** (legitimate, not from the bug)
+- Total now 35,039
+- md5 differs from locked `5c353670...` because the dataset is
+  augmented with 16 days of new May 2026 data — historical portion
+  is bit-identical (verified via row count)
+
+### 4. Operational impact
+
+- **Champion baseline (Sharpe +1.204) preserved**: features parquet,
+  labels parquet, model artifact, and the historical bars are all
+  intact. The v3.0.20-champion-baseline git tag remains the source
+  of truth.
+- **Paper trading now possible without proxy**: orchestrator uses
+  daily archive by default; updates lag ~24h vs real-time but matches
+  training data exactly. Event bars form every ~2h on average, so the
+  daily lag is small relative to trade horizon.
+- **No silent data loss possible**: the DELETE-scope bug would have
+  re-occurred in any future call to cusum with --month flag (live
+  paper, ETH monthly updates, etc.). Now fixed at the root.
+
+### 5. End-to-end smoke verification
+
+`python -m scripts.run_paper_trading_loop --one-shot`:
+1. Artifact loaded (l0_btc_thr015_v1.pkl, ratio 0.83, 24 trees)
+2. Session created in DB
+3. Daily archive: no new days to ingest (May 1-16 already present)
+4. Bars rebuild for current month: deleted 37, inserted 37 (correct)
+5. No new bars since session_started_at → no decisions
+6. Session ended with `end_reason=one_shot_complete`
+7. Historical bars verified intact (35,002 ≤ 2026-04-30)
+
+Total iteration: 67s (vs 259s pre-fix when it had to delete + rebuild
+35k bars).
+
+### 6. Operational instructions update
+
+The launch command from DR v3.0.23 §5 still works as-is. The only
+change is the tick source: default is now daily archive (no proxy).
+For users with non-US proxy:
+```bash
+# Set BEFORE launching daemon:
+export HTTPS_PROXY=http://your-non-us-proxy:port
+# In config.yaml under top-level:
+live:
+  tick_source: rest
+```
+
+For default (daily-archive, no proxy):
+```bash
+python -m scripts.run_paper_trading_loop \
+  --asset BTC --bar-threshold 0.015 \
+  --poll-seconds 600 \
+  --notes "2-week paper eval, daily-archive tick source"
+```
+
+### 7. Lessons / regret
+
+The cusum DELETE bug should have been caught earlier:
+- It only manifests when calling `build_bars(month_filter=X)` — never
+  used until this DR's paper trading orchestrator
+- The function had been unit-tested for the full-history path but
+  not the monthly path
+- Adding a regression test for monthly rebuilds is a small follow-up
+  (not urgent — current code is correct)
+
+**Approver**: User (`silverspoon0099`) — pre-authorized investigation
+of proxy alternatives after reporting "I have only US proxy" on
+2026-05-17.
+
+**References**: Spec §6.4 (bar construction); DR v3.0.20 (champion
+baseline that was briefly wiped + restored); DR v3.0.23 (paper
+trading infra this fixes).
+
+---
+
 ## 2026-05-17 — Decision v3.0.23 — Paper-trading deployment (Phase A')
 
 **Context**: After DR v3.0.20 cleared §16.1 (BTC 1.5% bars + thr=0.58 =

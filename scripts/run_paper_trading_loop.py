@@ -48,7 +48,7 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from data.db import init_paper_schema, close_pool, bars_table, ticks_table, get_connection
 from model.lgbm import apply_platt
-from live import binance_rest
+from live import binance_rest, binance_archive_daily
 from live.paper_exec import PaperTradeManager, start_session, end_session
 from live.audit_log import AuditLog
 
@@ -262,14 +262,23 @@ def loop_once(
                     max_pct=max_daily_loss_pct)
         return "halt"
 
-    # 2. Poll Binance for new ticks
+    # 2. Poll for new ticks. Default source: Binance daily archive
+    # (data.binance.vision, no proxy needed, ~24h latency, same as training).
+    # Override via cfg["live"]["tick_source"] = "rest" for real-time
+    # (requires HTTPS_PROXY/BINANCE_PROXY to non-US region).
+    tick_source = cfg.get("live", {}).get("tick_source", "daily_archive")
     try:
-        res = binance_rest.poll_and_insert(
-            symbol_for_db=asset, symbol_for_binance=f"{asset}USDT",
-        )
-        audit.write("tick_poll", **res)
+        if tick_source == "rest":
+            res = binance_rest.poll_and_insert(
+                symbol_for_db=asset, symbol_for_binance=f"{asset}USDT",
+            )
+        else:  # daily_archive (default)
+            res = binance_archive_daily.poll_and_ingest_daily(
+                symbol=asset, symbol_binance=f"{asset}USDT",
+            )
+        audit.write("tick_poll", source=tick_source, **res)
     except Exception as e:
-        audit.write("error", phase="tick_poll", error=str(e))
+        audit.write("error", phase="tick_poll", error=str(e), source=tick_source)
         LOG.exception("tick poll failed")
         # Continue iteration with whatever ticks we have
 

@@ -272,10 +272,29 @@ def build_bars(
             from data.db import bars_table
             t1 = time.perf_counter()
             with conn.cursor() as cur:
-                cur.execute(
-                    f"DELETE FROM {bars_table(symbol)} WHERE threshold_pct = %s",
-                    (threshold,),
-                )
+                # CRITICAL: when month_filter is set, restrict DELETE to that month.
+                # Previously DELETE was unconditional on threshold which wiped
+                # the entire history of bars at that threshold on every monthly
+                # rebuild — disastrous for paper trading where we re-build the
+                # current month every poll.
+                if month_filter is not None:
+                    next_m = (
+                        date(month_filter.year + 1, 1, 1)
+                        if month_filter.month == 12
+                        else date(month_filter.year, month_filter.month + 1, 1)
+                    )
+                    cur.execute(
+                        f"DELETE FROM {bars_table(symbol)} "
+                        f"WHERE threshold_pct = %s "
+                        f"  AND bar_close_ts >= %s AND bar_close_ts < %s",
+                        (threshold, month_filter, next_m),
+                    )
+                else:
+                    cur.execute(
+                        f"DELETE FROM {bars_table(symbol)} "
+                        f"WHERE threshold_pct = %s",
+                        (threshold,),
+                    )
                 deleted = cur.rowcount
                 with cur.copy(_bars_insert_copy_sql(symbol)) as cp:
                     cp.set_types(_BARS_INSERT_TYPES)
