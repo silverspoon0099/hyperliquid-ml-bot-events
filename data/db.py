@@ -300,6 +300,71 @@ def init_paper_schema() -> None:
         conn.commit()
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Backtest-trades schema (DR v3.0.25) — historical trades replayed from a
+# backtest config (TB, threshold, bar_threshold). Mirrors paper_trades for
+# dashboard parity. Distinguished by `run_id` (one row per backtest run).
+# ─────────────────────────────────────────────────────────────────────────
+_DDL_BACKTEST_RUNS = """
+CREATE TABLE IF NOT EXISTS events.backtest_runs (
+    run_id              TEXT             PRIMARY KEY,
+    asset               TEXT             NOT NULL,
+    bar_threshold       DOUBLE PRECISION NOT NULL,
+    tb_pct              DOUBLE PRECISION NOT NULL,
+    confidence_threshold DOUBLE PRECISION NOT NULL,
+    vertical_bars       INTEGER          NOT NULL,
+    cost_bps_round_trip DOUBLE PRECISION NOT NULL,
+    n_folds_total       INTEGER,
+    n_folds_evaluated   INTEGER,
+    sharpe_all_folds    DOUBLE PRECISION,
+    sharpe_nonzero      DOUBLE PRECISION,
+    n_trades_total      INTEGER,
+    win_pct_mean        DOUBLE PRECISION,
+    feature_set         TEXT,
+    git_commit          TEXT,
+    notes               TEXT,
+    created_at          TIMESTAMPTZ      NOT NULL DEFAULT now()
+);
+"""
+
+_DDL_BACKTEST_TRADES = """
+CREATE TABLE IF NOT EXISTS events.backtest_trades (
+    trade_id        BIGSERIAL        PRIMARY KEY,
+    run_id          TEXT             NOT NULL REFERENCES events.backtest_runs(run_id),
+    fold_id         INTEGER          NOT NULL,
+    bar_id_entry    BIGINT           NOT NULL,
+    entry_ts        TIMESTAMPTZ      NOT NULL,
+    entry_price     DOUBLE PRECISION NOT NULL,
+    direction       SMALLINT         NOT NULL,
+    p_long          DOUBLE PRECISION,
+    p_short         DOUBLE PRECISION,
+    p_neutral       DOUBLE PRECISION,
+    exit_bar_id     BIGINT,
+    exit_ts         TIMESTAMPTZ,
+    exit_price      DOUBLE PRECISION,
+    exit_reason     TEXT,
+    holding_bars    INTEGER,
+    pnl_bps_gross   DOUBLE PRECISION,
+    pnl_bps_net     DOUBLE PRECISION,
+    label           SMALLINT
+);
+CREATE INDEX IF NOT EXISTS backtest_trades_run_fold_idx
+    ON events.backtest_trades(run_id, fold_id);
+CREATE INDEX IF NOT EXISTS backtest_trades_run_entry_ts_idx
+    ON events.backtest_trades(run_id, entry_ts);
+"""
+
+
+def init_backtest_trades_schema() -> None:
+    """Create backtest-trades tables (DR v3.0.25). Idempotent."""
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_DDL_SCHEMA)
+            cur.execute(_DDL_BACKTEST_RUNS)
+            cur.execute(_DDL_BACKTEST_TRADES)
+        conn.commit()
+
+
 def ping() -> dict:
     """Verify DB + Timescale extension reachable."""
     with get_connection() as conn:

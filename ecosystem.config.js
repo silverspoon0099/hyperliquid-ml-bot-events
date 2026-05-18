@@ -39,5 +39,32 @@ module.exports = {
         TZ: 'UTC',
       },
     },
+    {
+      // DR v3.0.25 — Streamlit trade tracking dashboard
+      // Access at: http://<host>:8501
+      name: 'dashboard',
+      cwd: '/nvme1/projects/trading/hyperliquid-ml-bot-events',
+      script: '.venv/bin/streamlit',
+      args: [
+        'run', 'dashboard/app.py',
+        '--server.port', '8501',
+        '--server.address', '0.0.0.0',          // bind all interfaces (use 127.0.0.1 to restrict to localhost)
+        '--server.headless', 'true',            // no auto-open browser
+        '--browser.gatherUsageStats', 'false',  // privacy
+      ],
+      interpreter: 'none',
+      autorestart: true,
+      max_restarts: 10,
+      min_uptime: 30000,
+      restart_delay: 5000,
+      out_file: 'logs/dashboard_pm2_out.log',
+      error_file: 'logs/dashboard_pm2_err.log',
+      merge_logs: true,
+      time: true,
+      env: {
+        PYTHONUNBUFFERED: '1',
+        TZ: 'UTC',
+      },
+    },
   ],
 };

@@ -5,6 +5,122 @@
 
 ---
 
+## 2026-05-18 — Decision v3.0.25 — Trade tracking dashboard (Streamlit)
+
+**Context**: With paper trading live (v3.0.23/24) and bound to populate
+events.paper_* tables over the coming weeks, build a read-only web
+dashboard so trade activity is browsable without writing SQL each time.
+User requested both **paper sessions AND historical backtest trades**
+visible in the same UI.
+
+### 1. Scope
+
+Streamlit single-app, multi-page:
+- **Overview** — top-line KPIs, recent paper trades preview
+- **Paper Trading** — sessions, trades, decisions, equity curve
+- **Backtest** — runs, per-fold breakdown, all trades, equity curve
+- **Side-by-side** — paper vs backtest overlay (cum PnL)
+
+Read-only. Reuses `data/db.py` connection pool. Cached queries
+(30s TTL for paper, 60s for backtest) to keep UI snappy.
+
+### 2. New DB tables (DR v3.0.25)
+
+`events.backtest_runs` — one row per backfilled backtest run:
+- run_id (PK), asset, bar_threshold, tb_pct, confidence_threshold,
+  vertical_bars, cost_bps_round_trip, feature_set, git_commit, notes
+- Summary fields: n_folds_*, sharpe_all_folds, sharpe_nonzero,
+  n_trades_total, win_pct_mean
+
+`events.backtest_trades` — every trade from a backtest run:
+- trade_id (BIGSERIAL PK), run_id (FK), fold_id
+- bar_id_entry, entry_ts, entry_price, direction
+- p_long/p_short/p_neutral (primary's probas at entry)
+- exit_ts, exit_price, exit_reason, holding_bars
+- pnl_bps_gross, pnl_bps_net, label
+- Indexed on (run_id, fold_id) and (run_id, entry_ts)
+
+Schema bootstrap: `data.db.init_backtest_trades_schema()`.
+
+### 3. New code
+
+- `dashboard/queries.py` (~250 lines): all DB queries for the app.
+  Returns pandas DataFrames consumable by Streamlit.
+- `dashboard/app.py` (~330 lines): Streamlit multi-page app.
+  Uses plotly for charts.
+- `scripts/backfill_backtest_trades.py` (~280 lines): re-runs the
+  walk-forward training at a given config (default: champion 1.5%/
+  TB=0.03/thr=0.58) and persists every Trade into events.backtest_trades.
+  Inserts run metadata; deletes prior data for same run_id (idempotent
+  re-runs).
+- `ecosystem.config.js`: added `dashboard` pm2 entry alongside
+  `paper-trading`. Streamlit serves on 0.0.0.0:8501.
+
+### 4. Bar_id regeneration side-effect (DR v3.0.24 fallout)
+
+When restoring the 1.5% bars after the catastrophic DELETE bug
+(v3.0.24), the new bars got new BIGSERIAL bar_ids — the original
+features_btc_thr015.parquet and labels_btc_thr015.parquet referenced
+the OLD bar_ids. Re-built both parquets (~30s each) so they join
+correctly with the restored bars table. Determinism preserved at the
+content level (33-feature column values, label values) — just the
+join key was stale.
+
+Note: the L0 model artifact (l0_btc_thr015_v1.pkl) doesn't reference
+bar_ids and remains valid.
+
+### 5. Backfill result
+
+`python -m scripts.backfill_backtest_trades` (no args = champion defaults):
+- run_id: `champion_btc_thr015_tb030_t57` (the `t57` suffix is from
+  Python's `int(0.58*100)` = 57 floating-point quirk — cosmetic, not
+  a bug)
+- Wall clock: **170 seconds**
+- 631 trades inserted
+- Aggregate Sharpe(all 20 folds): **+1.2036** ← matches locked
+  champion +1.204 exactly (within rounding)
+- Sharpe(nonzero): +2.407
+- Win rate: 61.0% (per-trade-level vs prior 69.5% on per-active-fold-
+  average — different metric, same trades)
+
+### 6. Dashboard launch
+
+```bash
+# Already added to ecosystem.config.js
+pm2 start ecosystem.config.js --only dashboard
+# OR start everything together:
+pm2 start ecosystem.config.js
+```
+
+Access: `http://<host>:8501`
+
+If running on remote server with no public exposure, use SSH tunnel:
+```bash
+ssh -L 8501:localhost:8501 user@server
+# Then open http://localhost:8501 locally
+```
+
+### 7. Operational state
+
+After this DR, pm2 manages two processes:
+- **paper-trading** (id 42): the daemon, polling every 10 min for new
+  daily archives + L0 inference + paper trades + audit log
+- **dashboard** (id 43): Streamlit serving the trade tracker UI
+
+Both auto-restart. Logs in `logs/{paper_trading,dashboard}_pm2_{out,err}.log`.
+
+### 8. Pytest 64/64 still green.
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-18
+with "GO — Paper trades + backfilled backtest trades" + "Streamlit
+(Recommended)" on DR v3.0.25 candidate.
+
+**References**: DR v3.0.20 (champion baseline whose trades are
+backfilled); DR v3.0.23/24 (paper trading infrastructure feeding
+the live tables); spec §11 (backtesting).
+
+---
+
 ## 2026-05-17 — Decision v3.0.24 — Daily-archive tick source + cusum DELETE-scope fix
 
 **Context**: DR v3.0.23 shipped paper trading infrastructure but
