@@ -267,29 +267,40 @@ def loop_once(
     # Override via cfg["live"]["tick_source"] = "rest" for real-time
     # (requires HTTPS_PROXY/BINANCE_PROXY to non-US region).
     tick_source = cfg.get("live", {}).get("tick_source", "daily_archive")
+    new_ticks_ingested = 0
     try:
         if tick_source == "rest":
             res = binance_rest.poll_and_insert(
                 symbol_for_db=asset, symbol_for_binance=f"{asset}USDT",
             )
+            new_ticks_ingested = int(res.get("inserted", 0))
         else:  # daily_archive (default)
             res = binance_archive_daily.poll_and_ingest_daily(
                 symbol=asset, symbol_binance=f"{asset}USDT",
             )
+            new_ticks_ingested = int(res.get("rows_inserted", 0))
         audit.write("tick_poll", source=tick_source, **res)
     except Exception as e:
         audit.write("error", phase="tick_poll", error=str(e), source=tick_source)
         LOG.exception("tick poll failed")
         # Continue iteration with whatever ticks we have
 
-    # 3. Rebuild bars for current month
-    try:
-        bar_stats = _build_or_refresh_bars_current_month(asset, bar_threshold)
-        audit.write("bars_built", **{k: v for k, v in bar_stats.items()
-                                     if isinstance(v, (int, float, str))})
-    except Exception as e:
-        audit.write("error", phase="bars_build", error=str(e))
-        LOG.exception("bars build failed")
+    # 3. Rebuild bars for current month — ONLY if new ticks were ingested.
+    # v3.0.27 fix: rebuilding bars on every poll re-numbered May bars
+    # (cusum's delete-and-insert assigns new BIGSERIAL ids each time),
+    # leading to 595+ orphan decisions in the DB. Skip rebuild when there
+    # are no new ticks (the most common case between daily-archive releases).
+    if new_ticks_ingested > 0:
+        try:
+            bar_stats = _build_or_refresh_bars_current_month(asset, bar_threshold)
+            audit.write("bars_built", **{k: v for k, v in bar_stats.items()
+                                         if isinstance(v, (int, float, str))})
+        except Exception as e:
+            audit.write("error", phase="bars_build", error=str(e))
+            LOG.exception("bars build failed")
+    else:
+        audit.write("bars_build_skipped", reason="no_new_ticks_since_last_poll")
+        LOG.info("no new ticks → skipping bars rebuild (avoids bar_id churn)")
 
     # 4. Find new bars since last decision (or session start floor)
     last_bid = _get_max_decided_bar_id(mgr.session_id)
@@ -399,6 +410,8 @@ def main(argv: list[str]) -> int:
                    help="Audit log directory (relative to project root)")
     p.add_argument("--notes", default="", help="Free-text session notes")
     p.add_argument("--one-shot", action="store_true", help="Run one iteration then exit (smoke)")
+    p.add_argument("--confidence-threshold", type=float, default=None,
+                   help="Override cfg.model.signal_threshold. v3.0.20 champion uses 0.58.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -410,7 +423,13 @@ def main(argv: list[str]) -> int:
     from data.db import symbol_short
     sym = symbol_short(args.asset).upper()
     bar_threshold = args.bar_threshold
-    confidence_threshold = cfg["model"]["signal_threshold"]
+    confidence_threshold = (
+        args.confidence_threshold
+        if args.confidence_threshold is not None
+        else cfg["model"]["signal_threshold"]
+    )
+    LOG.info("confidence_threshold = %.3f (%s)", confidence_threshold,
+             "CLI override" if args.confidence_threshold is not None else "config default")
     tp_pct = cfg["labeling"]["tp_pct"].get(sym, cfg["labeling"]["tp_pct"]["BTC"])
     sl_pct = cfg["labeling"]["sl_pct"].get(sym, cfg["labeling"]["sl_pct"]["BTC"])
     vertical_bars = cfg["labeling"]["vertical_bars"]

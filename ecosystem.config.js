@@ -21,6 +21,7 @@ module.exports = {
         '-m', 'scripts.run_paper_trading_loop',
         '--asset', 'BTC',
         '--bar-threshold', '0.015',
+        '--confidence-threshold', '0.58',   // v3.0.20 champion (config default is 0.60 spec freeze)
         '--poll-seconds', '600',
         '--notes', '2-week paper eval after v3.0.20 champion (pm2-managed)',
       ],
@@ -41,16 +42,20 @@ module.exports = {
     },
     {
       // DR v3.0.25 — Streamlit trade tracking dashboard
-      // Access at: http://<host>:8501
+      // Fronted by nginx at: http://<host>/dashboard/
+      // Direct (localhost only): http://127.0.0.1:8501
       name: 'dashboard',
       cwd: '/nvme1/projects/trading/hyperliquid-ml-bot-events',
       script: '.venv/bin/streamlit',
       args: [
         'run', 'dashboard/app.py',
         '--server.port', '8501',
-        '--server.address', '0.0.0.0',          // bind all interfaces (use 127.0.0.1 to restrict to localhost)
-        '--server.headless', 'true',            // no auto-open browser
-        '--browser.gatherUsageStats', 'false',  // privacy
+        '--server.address', '127.0.0.1',         // localhost only — nginx fronts public access
+        '--server.headless', 'true',             // no auto-open browser
+        '--server.baseUrlPath', 'dashboard',     // for nginx subpath /dashboard/
+        '--server.enableCORS', 'false',          // nginx handles
+        '--server.enableXsrfProtection', 'false', // nginx handles
+        '--browser.gatherUsageStats', 'false',   // privacy
       ],
       interpreter: 'none',
       autorestart: true,

@@ -5,6 +5,114 @@
 
 ---
 
+## 2026-05-20 — Decision v3.0.27 — nginx subpath + paper trading bug fixes
+
+**Context**: User requested dashboard access from local machine via
+nginx (they already have nginx fronting a scalping bot on port 3000).
+While verifying the new routing via real dashboard data, two paper
+trading bugs surfaced from inspecting the live decisions table.
+
+### 1. nginx subpath for dashboard
+
+Existing nginx setup: `http://173.208.208.155/` → `localhost:3000`
+(scalping bot, Node). Adding `/dashboard/` as a second route to the
+same server block.
+
+`ops/nginx_tradingbot.conf` (new): combined config with two locations:
+- `/dashboard/` → `http://127.0.0.1:8501/dashboard/` (Streamlit, with
+  WebSocket upgrade headers, `proxy_read_timeout 86400` for long-lived
+  WS connections, `proxy_buffering off` for Streamlit's streaming)
+- `/` → `http://localhost:3000` (existing scalping bot — UNCHANGED)
+- `/dashboard` (no trailing slash) → 301 redirect to `/dashboard/`
+
+`ecosystem.config.js` updated for nginx-friendly Streamlit:
+- Bind `127.0.0.1` only (external bypass via port 8501 now blocked)
+- `--server.baseUrlPath=dashboard` so Streamlit emits asset URLs under
+  `/dashboard/...`
+- CORS/XSRF disabled (nginx handles)
+
+Install:
+```bash
+sudo cp ops/nginx_tradingbot.conf /etc/nginx/sites-available/tradingbot
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Access: `http://173.208.208.155/dashboard/` (no SSH tunnel needed).
+
+### 2. Bug 1 — Wrong confidence threshold
+
+Inspecting paper_decisions revealed `skip_reason=max_prob=0.541<thr=0.60`.
+The champion uses **thr=0.58** but the daemon was reading
+`cfg["model"]["signal_threshold"] = 0.60` (config spec freeze).
+
+**Fix**: added `--confidence-threshold` CLI flag to
+`scripts/run_paper_trading_loop.py`. ecosystem.config.js passes
+`--confidence-threshold 0.58` explicitly. Daemon log on startup now
+prints: `confidence_threshold = 0.580 (CLI override)`.
+
+### 3. Bug 2 — Bar_id churn / orphan decisions
+
+Inspecting bar_ids in `events.paper_decisions` for the live session:
+- 599 total decisions
+- 595 orphans (bar_id no longer in `events.bars_btc_cusum`)
+- Only 4 still referencing valid bar_ids
+
+**Root cause**: The orchestrator's `_build_or_refresh_bars_current_month`
+ran cusum on every 10-min poll. v3.0.24's month-scoped DELETE deleted
+all May 2026 bars and re-inserted ~37 fresh ones with NEW BIGSERIAL ids
+each time. The orchestrator's `bar_id > last_decided_bar_id` filter
+saw renumbered bars as "new" → re-inferred + re-decided the same
+physical bars every poll → 37 new (duplicate) decisions per poll.
+
+**Why no actual trade duplication**: `max_concurrent=1` would have
+blocked second trades on the same physical bar. The bug was decision-
+table bloat (compute waste + DB clutter), not double-trading.
+
+**Fix**: conditional bar rebuild — only call cusum.build_bars when
+`tick_poll` returned `rows_inserted > 0`. Since daily archives drop
+once per day at ~02:00 UTC, most 10-min polls now skip the rebuild
+entirely.
+
+Daemon log on no-tick polls now prints:
+`no new ticks → skipping bars rebuild (avoids bar_id churn)`
+
+**Cleanup**: deleted 595 orphan decisions from
+`events.paper_decisions` for session `btc_thr015_20260518`.
+
+### 4. Underlying issue (deferred)
+
+The real fix for bar_id stability is to make `bars/cusum.py` UPSERT
+based on `(threshold_pct, bar_close_ts)` instead of DELETE+INSERT.
+That requires a unique constraint and a staging-table rewrite of the
+COPY path (~half day work). Deferred — the orchestrator-level skip in
+this DR makes the day-to-day symptoms disappear.
+
+### 5. Active session reset
+
+The fresh start with corrected threshold + skip logic created a new
+session `btc_thr015_20260520`. The two prior sessions
+(`btc_thr015_20260517`, `_20260518`) remain in the dashboard for
+historical reference but contain no usable trades (all decisions hit
+the wrong-threshold filter).
+
+### 6. Tests + status
+
+- 64/64 pytest still green
+- pm2 status: paper-trading (pid 562xxx) + dashboard (pid 560xxx)
+- Daemon now correctly waits for daily archives, applies thr=0.58,
+  does not churn bar_ids
+
+**Approver**: User (`silverspoon0099`) — pre-authorized 2026-05-19
+with "please set ngix setup" + dashboard data observation prompting
+the bug fixes 2026-05-20.
+
+**References**: DR v3.0.20 (champion thr=0.58); DR v3.0.23/24/25
+(paper trading + dashboard infra this fixes); spec §10.1 (config
+freeze at thr=0.60 — preserved; daemon overrides via CLI for
+champion-config deployment).
+
+---
+
 ## 2026-05-18 — Decision v3.0.25 — Trade tracking dashboard (Streamlit)
 
 **Context**: With paper trading live (v3.0.23/24) and bound to populate
