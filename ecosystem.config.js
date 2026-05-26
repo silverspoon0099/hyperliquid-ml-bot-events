@@ -23,6 +23,7 @@ module.exports = {
         '--bar-threshold', '0.015',
         '--confidence-threshold', '0.58',   // v3.0.20 champion (config default is 0.60 spec freeze)
         '--poll-seconds', '600',
+        '--initial-lookback-hours', '168',  // v3.0.28: backfill 7 days on fresh-session restart
         '--notes', '2-week paper eval after v3.0.20 champion (pm2-managed)',
       ],
       interpreter: 'none',          // pm2 treats `script` as the executable

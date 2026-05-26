@@ -90,11 +90,12 @@ def paper_decisions(session_id: Optional[str] = None,
         conds.append("traded = true")
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     sql = f"""
-        SELECT session_id, bar_id, decided_at, p_long, p_short, p_neutral,
+        SELECT session_id, bar_id, bar_close_ts, decided_at,
+               p_long, p_short, p_neutral,
                max_prob, argmax_class, traded, skip_reason, trade_id
         FROM events.paper_decisions
         {where}
-        ORDER BY decided_at DESC
+        ORDER BY bar_close_ts DESC NULLS LAST, decided_at DESC
         LIMIT %s
     """
     params.append(limit)

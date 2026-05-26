@@ -247,6 +247,12 @@ def render_paper() -> None:
             df["p_long"]  = df["p_long"].apply(lambda v: f"{v:.3f}")
             df["p_short"] = df["p_short"].apply(lambda v: f"{v:.3f}")
             df["p_neutral"] = df["p_neutral"].apply(lambda v: f"{v:.3f}")
+            # Show bar_close_ts (the actual bar's close time) prominently before
+            # decided_at (when the orchestrator processed it).
+            cols_order = ["bar_close_ts", "decided_at", "bar_id", "p_long", "p_short",
+                          "p_neutral", "max_prob", "argmax_class", "traded",
+                          "skip_reason", "trade_id"]
+            df = df[[c for c in cols_order if c in df.columns]]
             st.dataframe(df, width="stretch", height=420)
 
 

@@ -5,6 +5,98 @@
 
 ---
 
+## 2026-05-26 — Decision v3.0.28 — Robust watermark + backfill on restart
+
+**Context**: User reported "after restarting pm2 yesterday I can't see any
+decisions" on 2026-05-26. Investigation revealed two compounding issues:
+
+1. **Bar churn still happening, just once per day** (post-v3.0.27 fix
+   reduced from every-poll to every-archive-ingest). When the daily
+   archive ingests, cusum rebuilds bars → renumbers all current-month
+   bar_ids. Decisions made before the rebuild become orphans
+   (`bar_close_ts=None` after JOIN with current bars table). All 20 prior
+   decisions across sessions `_20260518`/`_20260520` were orphans.
+
+2. **Session-start floor excluded recent activity**. Each pm2 restart
+   sets `session_started_at = NOW()`. The user's most recent restart was
+   2026-05-25 07:34 UTC, but the latest bar had closed at 00:30 UTC —
+   *before* the session started. With 0 prior decisions and no new bars
+   in the quiet period since, the daemon had no work to do and the
+   dashboard showed 0 decisions for 24 hours.
+
+### 1. Schema fix: bar_close_ts column on paper_decisions
+
+`ALTER TABLE events.paper_decisions ADD COLUMN bar_close_ts TIMESTAMPTZ`.
+Backfilled existing rows from JOIN with bars table (all 20 stayed NULL —
+confirmed all orphans). Added `UNIQUE INDEX (session_id, bar_close_ts)
+WHERE bar_close_ts IS NOT NULL` for content-stable dedup. Deleted 20
+orphans.
+
+### 2. Orchestrator: watermark by close_ts instead of bar_id
+
+`scripts/run_paper_trading_loop.py`:
+- `_get_max_decided_bar_id` → `_get_max_decided_close_ts` (returns
+  TIMESTAMPTZ or None)
+- `_new_bars_since`: filter `bar_close_ts > since_ts` instead of
+  `bar_id > X AND close_ts >= floor` (bar_id removed entirely from filter)
+- `_insert_decision` now writes `bar_close_ts`
+- Build `bar_id → bar_close_ts` lookup per iteration
+
+This is content-addressable and robust to any future bar_id renumbering.
+
+### 3. New CLI flag: --initial-lookback-hours
+
+On a FRESH session (no prior decisions), the watermark falls back to
+`session_started_at - lookback_hours`. ecosystem.config.js passes
+`--initial-lookback-hours 168` (7 days) so pm2 restarts backfill recent
+activity. If the session already has decisions, watermark is the latest
+decided `bar_close_ts` and `lookback` is ignored.
+
+Example log line: `initial_lookback_hours=168.0 → effective floor =
+2026-05-19 16:45:33`.
+
+### 4. Dashboard tweak
+
+`dashboard/queries.py`: changed decisions ORDER BY from `decided_at` to
+`bar_close_ts DESC NULLS LAST, decided_at DESC` so the dashboard sorts
+by bar time (what the user actually cares about). Column order in
+`dashboard/app.py` puts `bar_close_ts` first.
+
+### 5. Result after restart
+
+New session `btc_thr015_20260526` started 16:45 UTC with 168h lookback:
+- Backfilled 11 decisions covering 2026-05-20 05:32 → 2026-05-25 00:30
+- All argmax=LONG (BTC slight uptrend bias)
+- max_prob in [0.506, 0.574] — all below thr=0.58, so 0 trades
+- No orphans (decisions reference current bar_ids AND have stable
+  bar_close_ts)
+
+This proves the pipeline is working end-to-end. Trades will fire when
+max_prob crosses 0.58 — which hasn't happened in the recent quiet
+period.
+
+### 6. Deferred (not urgent now)
+
+The underlying cusum DELETE+INSERT renumbering is still a code smell.
+A proper UPSERT in cusum.py (preserving bar_ids across rebuilds)
+remains a future DR. The orchestrator now doesn't rely on bar_id
+stability, so the symptom is fully masked.
+
+### 7. Tests + status
+
+- 64/64 pytest still green
+- pm2 paper-trading running with new config
+- Dashboard restarted to pick up query/ordering changes
+- 11 decisions visible in dashboard for new session
+
+**Approver**: User (`silverspoon0099`) — reported the
+restart-loses-decisions symptom 2026-05-26, authorized investigation.
+
+**References**: DR v3.0.20 (champion thr=0.58); DR v3.0.23–27 (paper
+trading infra this stabilizes); spec §11 (backtesting).
+
+---
+
 ## 2026-05-20 — Decision v3.0.27 — nginx subpath + paper trading bug fixes
 
 **Context**: User requested dashboard access from local machine via

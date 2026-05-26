@@ -83,23 +83,24 @@ def _default_artifact_path(sym: str, bar_threshold: float) -> Path:
     return candidates[-1]  # highest version
 
 
-def _new_bars_since(last_bar_id: int, since_ts: datetime,
+def _new_bars_since(since_ts: datetime,
                      asset: str, bar_threshold: float) -> pd.DataFrame:
-    """Bars with bar_id > last_bar_id AND bar_close_ts >= since_ts.
+    """Bars whose bar_close_ts > since_ts (timestamp-based watermark).
 
-    The since_ts floor prevents the daemon from making retroactive decisions
-    on all historical bars when there are no prior decisions yet (fresh session).
+    Switched from bar_id-based filtering in v3.0.28 because cusum's
+    DELETE+INSERT renumbers bar_ids on each rebuild, making bar_id
+    an unstable identity. bar_close_ts is content-stable.
     """
     tbl = bars_table(asset)
     sql = (f"SELECT bar_id, bar_open_ts, bar_close_ts, open, high, low, close, "
            f"       volume, n_trades, cusum_pos, cusum_neg "
            f"FROM {tbl} "
            f"WHERE threshold_pct = {bar_threshold} "
-           f"  AND bar_id > %s AND bar_close_ts >= %s "
+           f"  AND bar_close_ts > %s "
            f"ORDER BY bar_close_ts ASC, bar_id ASC")
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, (int(last_bar_id), since_ts))
+            cur.execute(sql, (since_ts,))
             return pd.DataFrame(cur.fetchall())
 
 
@@ -148,21 +149,22 @@ def _decide(probs: np.ndarray, confidence_threshold: float
     return True, -1, "SHORT", f"p_short={p_short:.3f}>=thr AND argmax=SHORT"
 
 
-def _get_max_decided_bar_id(session_id: str) -> int:
-    """Latest bar_id we've already made a decision on. 0 if no decisions yet."""
+def _get_max_decided_close_ts(session_id: str) -> Optional[datetime]:
+    """Latest bar_close_ts we've already made a decision on for this session.
+    Returns None if no decisions yet. Robust to bar_id renumbering (v3.0.28)."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT COALESCE(MAX(bar_id), 0) AS max_bid "
+                "SELECT MAX(bar_close_ts) AS max_ts "
                 "FROM events.paper_decisions WHERE session_id = %s",
                 (session_id,),
             )
             row = cur.fetchone()
-            return int(row["max_bid"])
+            return row["max_ts"]
 
 
 def _insert_decision(
-    session_id: str, bar_id: int, probs: np.ndarray,
+    session_id: str, bar_id: int, bar_close_ts: datetime, probs: np.ndarray,
     traded: bool, argmax_class: str, skip_reason: Optional[str],
     trade_id: Optional[int],
 ) -> None:
@@ -173,12 +175,13 @@ def _insert_decision(
             cur.execute(
                 """
                 INSERT INTO events.paper_decisions
-                  (session_id, bar_id, p_long, p_short, p_neutral, max_prob,
+                  (session_id, bar_id, bar_close_ts, p_long, p_short, p_neutral, max_prob,
                    argmax_class, traded, skip_reason, trade_id)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (session_id, bar_id) DO NOTHING
                 """,
-                (session_id, int(bar_id), p_long, p_short, p_neutral, max_prob,
+                (session_id, int(bar_id), bar_close_ts,
+                 p_long, p_short, p_neutral, max_prob,
                  argmax_class, traded, skip_reason, trade_id),
             )
             conn.commit()
@@ -302,15 +305,20 @@ def loop_once(
         audit.write("bars_build_skipped", reason="no_new_ticks_since_last_poll")
         LOG.info("no new ticks → skipping bars rebuild (avoids bar_id churn)")
 
-    # 4. Find new bars since last decision (or session start floor)
-    last_bid = _get_max_decided_bar_id(mgr.session_id)
-    new_bars = _new_bars_since(last_bid, session_started_at, asset, bar_threshold)
+    # 4. Find new bars since last decided bar_close_ts (or session floor)
+    # v3.0.28: switched from bar_id-based to bar_close_ts-based watermark
+    # because cusum's DELETE+INSERT renumbers bar_ids on daily archive ingest.
+    # bar_close_ts is content-stable; survives renumbering.
+    watermark = _get_max_decided_close_ts(mgr.session_id)
+    if watermark is None:
+        watermark = session_started_at
+    new_bars = _new_bars_since(watermark, asset, bar_threshold)
     if len(new_bars) == 0:
-        audit.write("no_new_bars", last_decided_bar_id=last_bid)
+        audit.write("no_new_bars", watermark_ts=str(watermark))
     else:
         audit.write("new_bars_found", n=len(new_bars),
-                    first_bar_id=int(new_bars["bar_id"].iloc[0]),
-                    last_bar_id=int(new_bars["bar_id"].iloc[-1]))
+                    first_close_ts=str(new_bars["bar_close_ts"].iloc[0]),
+                    last_close_ts=str(new_bars["bar_close_ts"].iloc[-1]))
 
         # 5. Compute features for new bars (needs full bars for warmup)
         all_bars = _all_bars_for_features(asset, bar_threshold)
@@ -321,14 +329,22 @@ def loop_once(
         booster = artifact["booster"]
         platt = artifact["platt"]
 
+        # Build bar_id → bar_close_ts lookup
+        bar_close_ts_lookup = {
+            int(b): pd.Timestamp(t).to_pydatetime()
+            for b, t in zip(new_bars["bar_id"], new_bars["bar_close_ts"])
+        }
+
         # 6. Iterate new bars: predict + decide
         for _, row in feat_df.iterrows():
             bar_id = int(row["bar_id"])
+            bar_close_ts = bar_close_ts_lookup[bar_id]
             # Check if feature row has NaN (warmup not satisfied)
             X = row[feature_cols].astype("float64").values.reshape(1, -1)
             if np.isnan(X).any():
                 audit.write("skip_nan_features", bar_id=bar_id)
-                _insert_decision(mgr.session_id, bar_id, np.array([0., 0., 1.]),
+                _insert_decision(mgr.session_id, bar_id, bar_close_ts,
+                                 np.array([0., 0., 1.]),
                                  traded=False, argmax_class="NEUTRAL",
                                  skip_reason="nan_features", trade_id=None)
                 continue
@@ -338,7 +354,7 @@ def loop_once(
             should_trade, direction, argmax_class, reason = _decide(
                 probs, confidence_threshold,
             )
-            audit.write("l0_prediction", bar_id=bar_id,
+            audit.write("l0_prediction", bar_id=bar_id, bar_close_ts=str(bar_close_ts),
                         p_long=float(probs[0]), p_short=float(probs[1]), p_neutral=float(probs[2]),
                         argmax=argmax_class, decision=("TRADE" if should_trade else "SKIP"),
                         reason=reason)
@@ -356,7 +372,7 @@ def loop_once(
                 )
                 if tid is None:
                     audit.write("trade_skip_concurrent", bar_id=bar_id, reason="max_concurrent")
-                    _insert_decision(mgr.session_id, bar_id, probs, traded=False,
+                    _insert_decision(mgr.session_id, bar_id, bar_close_ts, probs, traded=False,
                                      argmax_class=argmax_class, skip_reason="concurrent_block",
                                      trade_id=None)
                     continue
@@ -364,11 +380,11 @@ def loop_once(
                 audit.write("trade_entry", trade_id=trade_id, bar_id=bar_id,
                             direction=direction, entry_price=float(bar_row["close"]),
                             reason=reason)
-                _insert_decision(mgr.session_id, bar_id, probs, traded=True,
+                _insert_decision(mgr.session_id, bar_id, bar_close_ts, probs, traded=True,
                                  argmax_class=argmax_class, skip_reason=None,
                                  trade_id=trade_id)
             else:
-                _insert_decision(mgr.session_id, bar_id, probs, traded=False,
+                _insert_decision(mgr.session_id, bar_id, bar_close_ts, probs, traded=False,
                                  argmax_class=argmax_class, skip_reason=reason,
                                  trade_id=None)
 
@@ -412,6 +428,11 @@ def main(argv: list[str]) -> int:
     p.add_argument("--one-shot", action="store_true", help="Run one iteration then exit (smoke)")
     p.add_argument("--confidence-threshold", type=float, default=None,
                    help="Override cfg.model.signal_threshold. v3.0.20 champion uses 0.58.")
+    p.add_argument("--initial-lookback-hours", type=float, default=0.0,
+                   help="On a FRESH session (no prior decisions), include bars whose "
+                        "close_ts >= (session_start - lookback_hours). Default 0 = "
+                        "only future bars. Set to 168 (7 days) on first deploy to "
+                        "backfill recent activity. Ignored if session already has decisions.")
     args = p.parse_args(argv[1:])
 
     logging.basicConfig(
@@ -481,6 +502,14 @@ def main(argv: list[str]) -> int:
     halt_path = Path(args.halt_file)
     end_reason = "normal"
     session_started_at = datetime.now(timezone.utc)
+    # v3.0.28: apply --initial-lookback-hours to backfill recent bars on a
+    # FRESH session. If session already has decisions, the loop_once watermark
+    # logic (max(decided bar_close_ts)) takes over and lookback is ignored.
+    if args.initial_lookback_hours > 0:
+        from datetime import timedelta
+        session_started_at = session_started_at - timedelta(hours=args.initial_lookback_hours)
+        LOG.info("initial_lookback_hours=%s → effective floor = %s",
+                 args.initial_lookback_hours, session_started_at)
 
     signal.signal(signal.SIGINT, _signal_handler)
     signal.signal(signal.SIGTERM, _signal_handler)
